@@ -23,37 +23,53 @@ func runtimeDir() (string, error) {
 		if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
 			dir = filepath.Join(x, "mcli")
 		} else {
-			dir = filepath.Join("/tmp", fmt.Sprintf("mcli-%d", os.Getuid()))
+			dir = shortDir()
 		}
 	}
+	return dir, ensurePrivateDir(dir)
+}
+
+// shortDir is the fallback socket directory, short enough for any id.
+func shortDir() string {
+	return filepath.Join("/tmp", fmt.Sprintf("mcli-%d", os.Getuid()))
+}
+
+// ensurePrivateDir creates dir (0700) or checks that an existing one is a
+// directory owned by this user, tightening its permissions if needed.
+func ensurePrivateDir(dir string) error {
 	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
-		return "", err
+		return err
 	}
 	st, err := os.Lstat(dir)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if !st.IsDir() {
-		return "", fmt.Errorf("runtime path %s is not a directory", dir)
+		return fmt.Errorf("runtime path %s is not a directory", dir)
 	}
 	if sys, ok := st.Sys().(*syscall.Stat_t); ok && int(sys.Uid) != os.Getuid() {
 		// Someone else pre-created it: refuse rather than talk to their socket.
-		return "", fmt.Errorf("runtime directory %s is owned by uid %d", dir, sys.Uid)
+		return fmt.Errorf("runtime directory %s is owned by uid %d", dir, sys.Uid)
 	}
 	if st.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return "", err
-		}
+		return os.Chmod(dir, 0o700)
 	}
-	return dir, nil
+	return nil
 }
 
+// endpointFor returns the socket path for id. When dir is too deep for a
+// Unix socket path (common in sandboxes), the socket moves to /tmp/mcli-<uid>
+// while locks and logs stay in dir.
 func endpointFor(dir, id string) (string, error) {
 	path := filepath.Join(dir, id+".sock")
-	if len(path) >= maxSocketPath {
-		return "", fmt.Errorf("socket path %s is too long; set %s to a shorter directory", path, config.EnvRuntime)
+	if len(path) < maxSocketPath {
+		return path, nil
 	}
-	return path, nil
+	short := shortDir()
+	if err := ensurePrivateDir(short); err != nil {
+		return "", fmt.Errorf("socket path %s is too long and %s is unusable: %w", path, short, err)
+	}
+	return filepath.Join(short, id+".sock"), nil
 }
 
 func detachAttrs() *syscall.SysProcAttr {

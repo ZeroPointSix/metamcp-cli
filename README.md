@@ -108,7 +108,7 @@ stdout **永远只有一个 JSON 对象**；stderr 只放给人看的提示。
 默认路径：CLI 自动拉起本地 daemon，daemon 持有一个长期 MCP Session，连续的 search/execute 不再触发服务端 `createServer` 和上游重新绑定；Agent 杀掉的是 CLI 进程，Session 在 daemon 手里，空闲退出时正常发 DELETE。
 
 - **隔离**：daemon id = `sha256(url + "\n" + api_key)[:12]`，换 URL 或 Key 自然对应新 daemon，旧的空闲退出。Key 通过 stdin 管道交给 daemon，不进命令行参数、不进环境变量、不写日志。
-- **IPC**：Unix Socket（`$MCLI_RUNTIME_DIR` > `$XDG_RUNTIME_DIR/mcli` > `/tmp/mcli-<uid>`，目录 0700 且校验属主，socket 0600，Linux `SO_PEERCRED` / macOS `LOCAL_PEERCRED` 校验对端 UID）；Windows Named Pipe（DACL 仅当前用户 SID）。绝不监听 TCP。每个请求一条连接、一行 NDJSON 请求 + 一行响应，带协议版本号。
+- **IPC**：Unix Socket（`$MCLI_RUNTIME_DIR` > `$XDG_RUNTIME_DIR/mcli` > `/tmp/mcli-<uid>`，目录 0700 且校验属主；目录太深、socket 路径超长时自动改放 `/tmp/mcli-<uid>`；socket 0600，Linux `SO_PEERCRED` / macOS `LOCAL_PEERCRED` 校验对端 UID）；Windows Named Pipe（DACL 仅当前用户 SID）。绝不监听 TCP。每个请求一条连接、一行 NDJSON 请求 + 一行响应，带协议版本号。
 - **单实例**：`<id>.lock` 文件锁；多个 CLI 同时冷启动只有一个拉起 daemon，其余等待就绪（最多约 1.5 s）。
 - **版本替换**：每次先 `hello`，协议版本或构建标识（版本 + 二进制大小/mtime 指纹）不一致就让旧 daemon 退出再拉起新的。
 - **Session 失效**：远端 404 Session not found（在执行前被拒绝）→ 重建 Session 并重试一次，并发请求只触发一次重建；超时、断连、5xx 一律不自动重试 execute。

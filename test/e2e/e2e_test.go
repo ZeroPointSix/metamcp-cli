@@ -396,3 +396,27 @@ func TestHelpIsNotJSON(t *testing.T) {
 		t.Fatalf("help: %v\n%s", err, out)
 	}
 }
+
+func TestDeepRuntimeDirStillUsesDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes have no path length limit")
+	}
+	e := newEnv(t)
+	deep := filepath.Join(t.TempDir(), strings.Repeat("d", 60), strings.Repeat("e", 60))
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	e.vars = append(e.vars, "MCLI_RUNTIME_DIR="+deep)
+	for i := 0; i < 2; i++ {
+		r := e.mustOK("", "search", "x")
+		if strings.Contains(r.stderr, "daemon unavailable") {
+			t.Fatalf("fell back to in-process mode: %s", r.stderr)
+		}
+	}
+	if e.srv.Created.Load() != 1 {
+		t.Errorf("created = %d, want 1 (one daemon session)", e.srv.Created.Load())
+	}
+	if st := e.mustOK("", "daemon", "status").json["data"].(map[string]any); st["running"] != true {
+		t.Errorf("status = %v", st)
+	}
+}

@@ -7,11 +7,22 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 )
 
 // Version is set at release time with -ldflags "-X .../version.Version=v1.2.3".
+// Binaries built by `go install module@version` take it from the build info.
 var Version = "dev"
+
+func init() {
+	if Version != "dev" {
+		return
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		Version = info.Main.Version
+	}
+}
 
 // UserAgent is sent on every HTTP request to the MetaMCP endpoint.
 func UserAgent() string {
