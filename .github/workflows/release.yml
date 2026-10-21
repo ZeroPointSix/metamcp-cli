@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  npm:
+    runs-on: ubuntu-latest
+    needs: github-release
+    if: ${{ vars.NPM_PUBLISH == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - run: node npm/build.mjs "${GITHUB_REF_NAME}" "$RUNNER_TEMP/npm"
+      - name: Publish (platform packages first, launcher last)
+        # Prereleases (v1.2.3-rc.1) go to the "next" dist-tag, releases to
+        # "latest". Versions already on the registry are skipped, so a failed
+        # run can simply be re-run.
+        run: |
+          tag=latest
+          case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          for d in "$RUNNER_TEMP"/npm/mcli-* "$RUNNER_TEMP"/npm/mcli; do
+            spec="$(node -p "const p=require('$d/package.json'); p.name+'@'+p.version")"
+            if npm view "$spec" version >/dev/null 2>&1; then
+              echo "skip $spec (already published)"
+              continue
+            fi
+            npm publish "$d" --access public --tag "$tag"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

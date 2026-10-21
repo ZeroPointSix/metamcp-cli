@@ -1,0 +1,28 @@
+{
+  "name": "@zeropointsix/mcli",
+  "version": "0.0.0",
+  "description": "MetaMCP CLI: search and call MetaMCP tools from the shell (Go binary launcher)",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZeroPointSix/metamcp-cli.git"
+  },
+  "bin": {
+    "mcli": "bin/mcli.js"
+  },
+  "files": [
+    "bin/mcli.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@zeropointsix/mcli-darwin-arm64": "0.0.0",
+    "@zeropointsix/mcli-darwin-x64": "0.0.0",
+    "@zeropointsix/mcli-linux-arm64": "0.0.0",
+    "@zeropointsix/mcli-linux-x64": "0.0.0",
+    "@zeropointsix/mcli-win32-arm64": "0.0.0",
+    "@zeropointsix/mcli-win32-x64": "0.0.0"
+  }
+}
