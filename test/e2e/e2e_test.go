@@ -469,6 +469,9 @@ func TestDoctor(t *testing.T) {
 	if r := e.run("", "doctor", "--probe", "x={not json"); r.exit != 2 || errCode(r) != "E_USAGE" {
 		t.Errorf("bad probe: exit %d %s", r.exit, r.stdout)
 	}
+	if r := e.run("", "doctor", "--expect", ","); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("empty expect: exit %d %s", r.exit, r.stdout)
+	}
 	wrongKey := newEnv(t)
 	wrongKey.vars = append(wrongKey.vars, "MCLI_API_KEY=wrong")
 	if r := wrongKey.run("", "doctor"); r.exit != 3 || errCode(r) != "E_AUTH" {
@@ -499,6 +502,12 @@ func TestToolsAndSchema(t *testing.T) {
 	if len(s) != 1 || s[0].(map[string]any)["inputSchema"] == nil {
 		t.Errorf("schema = %v", s)
 	}
+	if s := e.mustOK("", "schema", "tools.VPS__exec").json["data"].(map[string]any)["tools"].([]any); len(s) != 1 {
+		t.Errorf("schema with tools. prefix = %v", s)
+	}
+	if r := e.run("", "schema", " "); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("empty schema name: exit %d %s", r.exit, r.stdout)
+	}
 	r = e.run("", "schema", "VPS__exec", "VPS__run_script")
 	if r.exit != 1 || errCode(r) != "E_TOOL_NOT_FOUND" {
 		t.Fatalf("schema typo: exit %d %s", r.exit, r.stdout)
@@ -521,6 +530,17 @@ func TestExecuteSuggestsToolNames(t *testing.T) {
 	errObj := r.json["error"].(map[string]any)
 	if fmt.Sprint(errObj["suggestions"]) != "[VPS__run-script]" || !strings.HasPrefix(errObj["hint"].(string), `Did you mean "VPS__run-script"?`) {
 		t.Errorf("error = %v", errObj)
+	}
+
+	// Some servers wrap the child E_TOOL_NOT_FOUND in a top-level E_RUNTIME;
+	// the name in the diagnostics/message must still produce suggestions.
+	r = e.run("const marker = \"__MISSING_TOOL_RUNTIME__\";\nreturn await tools.VPS.run_script({});", "execute", "-")
+	if r.exit != 1 || errCode(r) != "E_RUNTIME" {
+		t.Fatalf("runtime wrapper: exit %d: %s", r.exit, r.stdout)
+	}
+	errObj = r.json["error"].(map[string]any)
+	if fmt.Sprint(errObj["suggestions"]) != "[VPS__run-script]" || !strings.HasPrefix(errObj["hint"].(string), `Did you mean "VPS__run-script"?`) {
+		t.Errorf("runtime wrapper error = %v", errObj)
 	}
 }
 

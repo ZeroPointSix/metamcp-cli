@@ -42,9 +42,16 @@ func parseProbe(s string) (probeSpec, error) {
 		return p, output.Newf(output.CodeUsage, "--probe %q: missing tool name", s)
 	}
 	if hasArgs {
-		if err := json.Unmarshal([]byte(raw), &p.Args); err != nil {
+		var args map[string]any
+		if err := json.Unmarshal([]byte(raw), &args); err != nil {
 			return p, output.Newf(output.CodeUsage, "--probe %q: arguments must be a JSON object: %v", s, err)
 		}
+		// JSON null unmarshals into a nil map without an error; tools expect an
+		// object, so treat it like any other non-object argument.
+		if args == nil {
+			return p, output.Newf(output.CodeUsage, "--probe %q: arguments must be a JSON object", s)
+		}
+		p.Args = args
 	}
 	return p, nil
 }
@@ -85,11 +92,16 @@ func classifyProbe(code, message string) probeReport {
 		}
 	}
 	switch {
-	case strings.Contains(message, "AUTH_REAUTHORIZATION_REQUIRED") || contract.ErrorClass == "auth_invalid" || contract.ErrorClass == "permission":
+	case strings.Contains(message, "AUTH_REAUTHORIZATION_REQUIRED") ||
+		contract.ErrorCode == "AUTH_REAUTHORIZATION_REQUIRED" ||
+		contract.ErrorClass == "auth_invalid" || contract.ErrorClass == "permission":
 		r.Status = probeAuthRequired
-	case code == output.CodeToolNotFound:
+	case code == output.CodeToolNotFound ||
+		contract.ErrorCode == "UNKNOWN_TOOL" || contract.ErrorClass == "unknown_tool" ||
+		strings.Contains(message, "Unknown tool:"):
 		r.Status = probeNotFound
-	case code == "E_CHILD_TIMEOUT" || code == output.CodeTimeout:
+	case code == "E_CHILD_TIMEOUT" || code == output.CodeTimeout ||
+		contract.ErrorCode == "E_CHILD_TIMEOUT" || contract.ErrorClass == "timeout":
 		r.Status = probeTimeout
 	}
 	return r
@@ -153,6 +165,15 @@ usual codes (exit 2/3/4). That makes it a post-deploy smoke test:
 			if timeout <= 0 {
 				return output.New(output.CodeUsage, "--timeout must be positive")
 			}
+			wants := make([]string, 0, len(expect))
+			for _, e := range expect {
+				if e = strings.TrimSpace(e); e != "" {
+					wants = append(wants, e)
+				}
+			}
+			if len(expect) > 0 && len(wants) == 0 {
+				return output.New(output.CodeUsage, "--expect needs at least one server name")
+			}
 			cfg, err := a.resolve()
 			if err != nil {
 				return a.setResult(output.Fail(err))
@@ -205,15 +226,14 @@ usual codes (exit 2/3/4). That makes it a post-deploy smoke test:
 			}
 
 			var problems []string
-			if len(expect) > 0 {
+			if len(wants) > 0 {
 				have := make([]string, 0, len(got.Categories))
 				for c := range got.Categories {
 					have = append(have, c)
 				}
 				var missing []string
-				for _, want := range expect {
-					want = strings.TrimSpace(want)
-					if want == "" || got.Categories[want] > 0 {
+				for _, want := range wants {
+					if got.Categories[want] > 0 {
 						continue
 					}
 					missing = append(missing, want)
@@ -223,7 +243,7 @@ usual codes (exit 2/3/4). That makes it a post-deploy smoke test:
 					}
 					problems = append(problems, msg)
 				}
-				report["expect"] = map[string]any{"servers": expect, "missing": nonNil(missing)}
+				report["expect"] = map[string]any{"servers": wants, "missing": nonNil(missing)}
 			}
 			if len(specs) > 0 {
 				reports := make([]probeReport, 0, len(got.Probes))

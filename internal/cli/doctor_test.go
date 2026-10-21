@@ -14,7 +14,11 @@ func TestClassifyProbe(t *testing.T) {
 		{"E_RUNTIME", reauth, probeAuthRequired},
 		{"E_RUNTIME", `{"error":"bad token","error_class":"auth_invalid"}`, probeAuthRequired},
 		{output.CodeToolNotFound, `{"error":"Unknown tool: a__b"}`, probeNotFound},
+		{"E_RUNTIME", `{"error":"Unknown tool: a__b","error_code":"UNKNOWN_TOOL"}`, probeNotFound},
+		{"E_RUNTIME", `{"error":"Unknown tool: a__b","error_class":"unknown_tool"}`, probeNotFound},
+		{"E_RUNTIME", "Unknown tool: a__b", probeNotFound},
 		{"E_CHILD_TIMEOUT", "Child tool call timed out.", probeTimeout},
+		{"E_RUNTIME", `{"error":"timed out","error_class":"timeout"}`, probeTimeout},
 		{"E_INVALID_ARGUMENT", "command is required", probeError},
 	}
 	for _, c := range cases {
@@ -36,7 +40,7 @@ func TestParseProbe(t *testing.T) {
 	if p, err := parseProbe("github__get_me"); err != nil || len(p.Args) != 0 {
 		t.Errorf("no args: %+v, %v", p, err)
 	}
-	for _, bad := range []string{"=", "x=[1]", "x={"} {
+	for _, bad := range []string{"=", "x=[1]", "x=null", "x={"} {
 		if _, err := parseProbe(bad); err == nil {
 			t.Errorf("parseProbe(%q) should fail", bad)
 		}

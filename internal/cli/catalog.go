@@ -143,6 +143,10 @@ func groupByCategory(items []listedTool) map[string]any {
 
 func unknownCategory(category string, have []string) *output.Error {
 	e := output.Newf(output.CodeToolNotFound, "no server (category) %q on this endpoint", category)
+	if len(have) == 0 {
+		e.Hint = "This endpoint exposes no tools; check that upstream servers are mapped and active with `mcli doctor`."
+		return e
+	}
 	e.Suggestions = similarNames(category, have)
 	slices.Sort(have)
 	if len(e.Suggestions) > 0 {
@@ -188,6 +192,9 @@ exist, the error lists spellings that do (for example "_" swapped for "-").`,
 				}
 				names = append(names, n)
 				variants[n] = catalog.Variants(n)
+			}
+			if len(names) == 0 {
+				return output.New(output.CodeUsage, "no tool name given; pass server__tool (for example VPS__exec)")
 			}
 			cfg, err := a.resolve()
 			if err != nil {
@@ -267,14 +274,16 @@ func missingTool(res *output.Result) string {
 	return ""
 }
 
-// suggestToolNames adds "did you mean" suggestions to an E_TOOL_NOT_FOUND
-// failure by checking which "_"/"-" spellings of the name exist. It costs one
-// extra catalog read, only on this failure path.
+// suggestToolNames adds "did you mean" suggestions to a failure that names a
+// missing tool by checking which "_"/"-" spellings exist. It triggers on the
+// name in the diagnostics/message rather than on the top-level code: older
+// servers wrap the same child error in E_RUNTIME. It costs one extra catalog
+// read, only on this failure path.
 func (a *app) suggestToolNames(ctx context.Context, cfg *config.Resolved, res *output.Result) {
-	if res.OK || res.Error == nil || res.Error.Code != output.CodeToolNotFound {
+	if res.OK || res.Error == nil {
 		return
 	}
-	name := missingTool(res)
+	name := catalog.Normalize(missingTool(res))
 	variants := catalog.Variants(name)
 	if len(variants) == 0 {
 		return
@@ -297,8 +306,12 @@ func capabilityHint(res *output.Result) {
 	if res.OK || res.Error == nil {
 		return
 	}
-	msg := res.Error.Message
-	if strings.Contains(msg, "tools.search is not a function") || strings.Contains(msg, "unknown option: declaration") {
+	msg := strings.ToLower(res.Error.Message)
+	missingSearch := strings.Contains(msg, "tools.search is not a function")
+	missingDecl := strings.Contains(msg, "declaration") &&
+		(strings.Contains(msg, "unknown option") || strings.Contains(msg, "unknown argument") ||
+			strings.Contains(msg, "not supported") || strings.Contains(msg, "unexpected option"))
+	if missingSearch || missingDecl {
 		res.Error.Hint = strings.TrimSpace("This MetaMCP server predates tools.search() and tools.list({ declaration }). Use `mcli search`, `mcli tools` or `mcli schema` instead, or tools.list({ names, schema: true }) in scripts; `mcli doctor` shows what the server supports. " + res.Error.Hint)
 	}
 }

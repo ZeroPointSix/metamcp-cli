@@ -43,6 +43,7 @@ func TestNormalizeAndCallHint(t *testing.T) {
 		"VPS__exec":            "VPS__exec",
 		"VPS.exec":             "VPS__exec",
 		"tools.VPS.run-script": "VPS__run-script",
+		"tools.VPS__exec":      "VPS__exec",
 		" github__get_me ":     "github__get_me",
 		"plain":                "plain",
 	} {

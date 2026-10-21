@@ -12,6 +12,8 @@
 //	__PARTIAL__       failed envelope with partial=true
 //	__WARN__          warning-bearing success envelope
 //	__MISSING_TOOL__  E_TOOL_NOT_FOUND for VPS__run_script (exists as VPS__run-script)
+//	__MISSING_TOOL_RUNTIME__  the same child error wrapped in a top-level E_RUNTIME
+//	                         (older servers report unknown tools this way)
 //	console.log       adds a <console_output> block
 //
 // The scripts mcli generates itself (they start with "const args = ") are
@@ -306,8 +308,12 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 	}
 
 	switch {
-	case strings.Contains(args.Code, "__MISSING_TOOL__"):
-		res := fail("E_TOOL_NOT_FOUND", "ChildCallError: "+unknownTool("VPS__run_script"), 1, 1, false)
+	case strings.Contains(args.Code, "__MISSING_TOOL__") || strings.Contains(args.Code, "__MISSING_TOOL_RUNTIME__"):
+		code := "E_TOOL_NOT_FOUND"
+		if strings.Contains(args.Code, "__MISSING_TOOL_RUNTIME__") {
+			code = "E_RUNTIME"
+		}
+		res := fail(code, "ChildCallError: "+unknownTool("VPS__run_script"), 1, 1, false)
 		var env map[string]any
 		_ = json.Unmarshal([]byte(res.Content[0].(*mcp.TextContent).Text), &env)
 		env["diagnostics"].([]any)[0].(map[string]any)["location"].(map[string]any)["tool"] = "VPS__run_script"

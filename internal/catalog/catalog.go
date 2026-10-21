@@ -19,13 +19,15 @@ const separator = "__"
 // maxVariants bounds the names tried for one misspelt tool.
 const maxVariants = 64
 
-// Normalize accepts "server__tool", "server.tool" and "tools.server.tool".
+// Normalize accepts "server__tool", "server.tool" and "tools.server.tool",
+// and also tolerates the "tools." prefix on a logical name
+// ("tools.server__tool"), which agents sometimes copy from a script.
 func Normalize(name string) string {
 	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "tools.")
 	if strings.Contains(name, separator) {
 		return name
 	}
-	name = strings.TrimPrefix(name, "tools.")
 	if server, tool, ok := strings.Cut(name, "."); ok && server != "" && tool != "" {
 		return server + separator + tool
 	}
@@ -125,7 +127,9 @@ if (args.category) {
   try {
     items = await tools.list({ category: args.category, detail: true, ...(declaration ? { declaration: true } : {}) });
   } catch (e) {
-    if (!declaration || e.code !== "E_INVALID_ARGUMENT") throw e;
+    // Declarations are optional: retry once without them, whatever the server
+    // calls the rejection (older MetaMCP and proxies have used several codes).
+    if (!declaration) throw e;
     declaration = false;
     items = await tools.list({ category: args.category, detail: true });
   }
@@ -144,7 +148,8 @@ let items;
 try {
   items = await tools.list({ ...opts, declaration: true });
 } catch (e) {
-  if (e.code !== "E_INVALID_ARGUMENT" && e.code !== "E_TOOL_LIST_TOO_LARGE") throw e;
+  // The declaration is additive. A server that rejects the option, or the
+  // combined output, still has the schema itself; only a second failure is real.
   declaration = false;
   items = await tools.list(opts);
 }
@@ -166,7 +171,8 @@ if (all.length > 0) {
     await tools.list({ names: [all[0].name], declaration: true });
     capabilities.list_declaration = true;
   } catch (e) {
-    if (e.code !== "E_INVALID_ARGUMENT") throw e;
+    // Capability detection is best-effort; never fail doctor because an
+    // older server rejects the optional declaration argument.
   }
 }
 const probes = await Promise.all(args.probes.map(async (p) => {

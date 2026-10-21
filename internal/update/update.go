@@ -118,7 +118,6 @@ func parse(v string) (semver, bool) {
 }
 
 // compare orders versions; a release sorts after its pre-releases.
-// Pre-release suffixes compare as strings, which is enough for -rc.N.
 func compare(a, b semver) int {
 	for i := range a.n {
 		if a.n[i] != b.n[i] {
@@ -136,5 +135,40 @@ func compare(a, b semver) int {
 	case b.pre == "":
 		return -1
 	}
-	return strings.Compare(a.pre, b.pre)
+	return comparePre(a.pre, b.pre)
+}
+
+// comparePre orders dot-separated pre-release identifiers the way semver
+// specifies: numeric identifiers compare numerically (rc.10 > rc.9), numeric
+// sorts before alphanumeric, and a longer identifier list wins when all
+// shared identifiers are equal (rc.1.1 > rc.1).
+func comparePre(a, b string) int {
+	ap, bp := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(ap) && i < len(bp); i++ {
+		if ap[i] == bp[i] {
+			continue
+		}
+		an, aErr := strconv.Atoi(ap[i])
+		bn, bErr := strconv.Atoi(bp[i])
+		switch {
+		case aErr == nil && bErr == nil:
+			if an < bn {
+				return -1
+			}
+			return 1
+		case aErr == nil:
+			return -1 // numeric identifiers sort before alphanumeric ones
+		case bErr == nil:
+			return 1
+		default:
+			return strings.Compare(ap[i], bp[i])
+		}
+	}
+	switch {
+	case len(ap) < len(bp):
+		return -1
+	case len(ap) > len(bp):
+		return 1
+	}
+	return 0
 }
