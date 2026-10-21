@@ -248,6 +248,8 @@ type Status struct {
 	Connected       bool      `json:"connected"`
 	SessionID       string    `json:"session_id,omitempty"`
 	ProtocolVersion string    `json:"protocol_version,omitempty"`
+	ServerName      string    `json:"server_name,omitempty"`
+	ServerVersion   string    `json:"server_version,omitempty"`
 	ConnectedAt     time.Time `json:"connected_at,omitzero"`
 	Rebuilds        int       `json:"rebuilds"`
 }
@@ -265,6 +267,9 @@ func (c *Conn) Status() Status {
 		}
 		if ir := sess.InitializeResult(); ir != nil {
 			st.ProtocolVersion = ir.ProtocolVersion
+			if ir.ServerInfo != nil {
+				st.ServerName, st.ServerVersion = ir.ServerInfo.Name, ir.ServerInfo.Version
+			}
 		}
 		st.ConnectedAt = c.connectedAt
 	}

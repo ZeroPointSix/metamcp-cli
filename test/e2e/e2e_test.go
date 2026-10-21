@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -418,5 +420,142 @@ func TestDeepRuntimeDirStillUsesDaemon(t *testing.T) {
 	}
 	if st := e.mustOK("", "daemon", "status").json["data"].(map[string]any); st["running"] != true {
 		t.Errorf("status = %v", st)
+	}
+}
+
+func TestDoctor(t *testing.T) {
+	e := newEnv(t, "MCLI_NO_UPDATE_CHECK=1")
+	r := e.mustOK("", "doctor", "--expect", "github,VPS", "--probe", "github__get_me", "--probe", `VPS__exec={"command":"true"}`)
+	data := r.json["data"].(map[string]any)
+	if srv := data["server"].(map[string]any); srv["version"] != fakeserver.Version || srv["protocol_version"] != "2025-11-25" {
+		t.Errorf("server = %v", srv)
+	}
+	if servers := data["servers"].(map[string]any); servers["VPS"] != float64(3) || servers["github"] != float64(2) {
+		t.Errorf("servers = %v", servers)
+	}
+	for _, p := range data["probes"].([]any) {
+		if p.(map[string]any)["status"] != "ok" {
+			t.Errorf("probe = %v", p)
+		}
+	}
+	if strings.Contains(e.srv.LastCode(), "sk_test_key") {
+		t.Error("the API key must not reach the script")
+	}
+
+	// A missing server, a misspelt probe and an upstream needing re-authorization.
+	e.srv.RequireReauth("github__get_me")
+	r = e.run("", "doctor", "--expect", "github,vps,openmessage", "--probe", "github__get_me", "--probe", "VPS__list_profiles")
+	if r.exit != 1 || errCode(r) != "E_DOCTOR" {
+		t.Fatalf("exit %d: %s", r.exit, r.stdout)
+	}
+	data = r.json["data"].(map[string]any)
+	missing := data["expect"].(map[string]any)["missing"].([]any)
+	if len(missing) != 2 || missing[0] != "vps" || missing[1] != "openmessage" {
+		t.Errorf("missing = %v", missing)
+	}
+	probes := data["probes"].([]any)
+	auth, typo := probes[0].(map[string]any), probes[1].(map[string]any)
+	if auth["status"] != "auth_required" || auth["error_code"] != "AUTH_REAUTHORIZATION_REQUIRED" || auth["authorization_url"] == nil {
+		t.Errorf("auth probe = %v", auth)
+	}
+	if typo["status"] != "not_found" || fmt.Sprint(typo["suggestions"]) != "[VPS__list-profiles]" {
+		t.Errorf("typo probe = %v", typo)
+	}
+	msg := r.json["error"].(map[string]any)["message"].(string)
+	if !strings.Contains(msg, `did you mean "VPS"`) || !strings.Contains(msg, "openmessage") {
+		t.Errorf("message = %s", msg)
+	}
+
+	if r := e.run("", "doctor", "--probe", "x={not json"); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("bad probe: exit %d %s", r.exit, r.stdout)
+	}
+	if r := e.run("", "doctor", "--expect", ","); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("empty expect: exit %d %s", r.exit, r.stdout)
+	}
+	wrongKey := newEnv(t)
+	wrongKey.vars = append(wrongKey.vars, "MCLI_API_KEY=wrong")
+	if r := wrongKey.run("", "doctor"); r.exit != 3 || errCode(r) != "E_AUTH" {
+		t.Errorf("wrong key: exit %d %s", r.exit, r.stdout)
+	}
+}
+
+func TestToolsAndSchema(t *testing.T) {
+	e := newEnv(t)
+	all := e.mustOK("", "tools").json["data"].(map[string]any)
+	cats := all["categories"].([]any)
+	if all["count"] != float64(5) || len(cats) != 2 || cats[0].(map[string]any)["category"] != "VPS" {
+		t.Errorf("tools = %v", all)
+	}
+	vps := e.mustOK("", "tools", "--category", "VPS").json["data"].(map[string]any)
+	if vps["count"] != float64(3) || vps["tools"].([]any)[0].(map[string]any)["summary"] == nil {
+		t.Errorf("tools --category = %v", vps)
+	}
+	r := e.run("", "tools", "--category", "vps")
+	if r.exit != 1 || errCode(r) != "E_TOOL_NOT_FOUND" || fmt.Sprint(r.json["error"].(map[string]any)["suggestions"]) != "[VPS]" {
+		t.Errorf("unknown category: exit %d %s", r.exit, r.stdout)
+	}
+	if r := e.run("", "tools", "--declarations"); r.exit != 2 {
+		t.Errorf("--declarations without --category: exit %d", r.exit)
+	}
+
+	s := e.mustOK("", "schema", "VPS.exec").json["data"].(map[string]any)["tools"].([]any)
+	if len(s) != 1 || s[0].(map[string]any)["inputSchema"] == nil {
+		t.Errorf("schema = %v", s)
+	}
+	if s := e.mustOK("", "schema", "tools.VPS__exec").json["data"].(map[string]any)["tools"].([]any); len(s) != 1 {
+		t.Errorf("schema with tools. prefix = %v", s)
+	}
+	if r := e.run("", "schema", " "); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("empty schema name: exit %d %s", r.exit, r.stdout)
+	}
+	r = e.run("", "schema", "VPS__exec", "VPS__run_script")
+	if r.exit != 1 || errCode(r) != "E_TOOL_NOT_FOUND" {
+		t.Fatalf("schema typo: exit %d %s", r.exit, r.stdout)
+	}
+	errObj := r.json["error"].(map[string]any)
+	if fmt.Sprint(errObj["suggestions"]) != "[VPS__run-script]" || !strings.Contains(errObj["hint"].(string), `tools.VPS["run-script"](args)`) {
+		t.Errorf("schema typo error = %v", errObj)
+	}
+	if len(r.json["data"].(map[string]any)["tools"].([]any)) != 1 {
+		t.Errorf("the tools that exist should still be returned: %s", r.stdout)
+	}
+}
+
+func TestExecuteSuggestsToolNames(t *testing.T) {
+	e := newEnv(t)
+	r := e.run("const marker = \"__MISSING_TOOL__\";\nreturn await tools.VPS.run_script({});", "execute", "-")
+	if r.exit != 1 || errCode(r) != "E_TOOL_NOT_FOUND" {
+		t.Fatalf("exit %d: %s", r.exit, r.stdout)
+	}
+	errObj := r.json["error"].(map[string]any)
+	if fmt.Sprint(errObj["suggestions"]) != "[VPS__run-script]" || !strings.HasPrefix(errObj["hint"].(string), `Did you mean "VPS__run-script"?`) {
+		t.Errorf("error = %v", errObj)
+	}
+
+	// Some servers wrap the child E_TOOL_NOT_FOUND in a top-level E_RUNTIME;
+	// the name in the diagnostics/message must still produce suggestions.
+	r = e.run("const marker = \"__MISSING_TOOL_RUNTIME__\";\nreturn await tools.VPS.run_script({});", "execute", "-")
+	if r.exit != 1 || errCode(r) != "E_RUNTIME" {
+		t.Fatalf("runtime wrapper: exit %d: %s", r.exit, r.stdout)
+	}
+	errObj = r.json["error"].(map[string]any)
+	if fmt.Sprint(errObj["suggestions"]) != "[VPS__run-script]" || !strings.HasPrefix(errObj["hint"].(string), `Did you mean "VPS__run-script"?`) {
+		t.Errorf("runtime wrapper error = %v", errObj)
+	}
+}
+
+func TestVersionCheck(t *testing.T) {
+	releases := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ZeroPointSix/metamcp-cli/releases/tag/v99.0.0", http.StatusFound)
+	}))
+	defer releases.Close()
+	e := newEnv(t, "MCLI_RELEASES_URL="+releases.URL+"/releases/latest")
+	data := e.mustOK("", "version", "--check").json["data"].(map[string]any)
+	if data["latest"] != "v99.0.0" || data["version"] == nil {
+		t.Errorf("version --check = %v", data)
+	}
+	cli := e.mustOK("", "doctor").json["data"].(map[string]any)["cli"].(map[string]any)
+	if cli["latest"] != "v99.0.0" {
+		t.Errorf("doctor cli = %v", cli)
 	}
 }

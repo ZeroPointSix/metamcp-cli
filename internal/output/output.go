@@ -39,6 +39,10 @@ const (
 	CodeFacade         = "E_FACADE"
 	CodeDaemon         = "E_DAEMON"
 	CodeInternal       = "E_INTERNAL"
+	// CodeDoctor means `mcli doctor` found problems; data holds the report.
+	CodeDoctor = "E_DOCTOR"
+	// CodeToolNotFound is also produced by the server's Code Mode.
+	CodeToolNotFound = "E_TOOL_NOT_FOUND"
 )
 
 var exitByCode = map[string]int{
@@ -109,7 +113,9 @@ type Error struct {
 	Line   int    `json:"line,omitempty"`
 	Column int    `json:"column,omitempty"`
 	Hint   string `json:"hint,omitempty"`
-	Exit   int    `json:"exit"`
+	// Suggestions are existing tool names close to a missing one.
+	Suggestions []string `json:"suggestions,omitempty"`
+	Exit        int      `json:"exit"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
