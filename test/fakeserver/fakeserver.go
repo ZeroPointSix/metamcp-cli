@@ -11,7 +11,11 @@
 //	__LIMIT__         E_CALL_LIMIT envelope
 //	__PARTIAL__       failed envelope with partial=true
 //	__WARN__          warning-bearing success envelope
+//	__MISSING_TOOL__  E_TOOL_NOT_FOUND for VPS__run_script (exists as VPS__run-script)
 //	console.log       adds a <console_output> block
+//
+// The scripts mcli generates itself (they start with "const args = ") are
+// answered from Catalog, as tools.list would.
 //
 // Otherwise it returns {"code_len", "timeout_ms", "note"} as the script result.
 package fakeserver
@@ -37,6 +41,18 @@ import (
 // Path is the MCP endpoint path served.
 const Path = "/metamcp/test/mcp"
 
+// Version is reported in serverInfo.
+const Version = "1.0.81-test"
+
+// Catalog is the fake endpoint's tool catalog (logical names).
+var Catalog = []string{
+	"VPS__exec",
+	"VPS__list-profiles",
+	"VPS__run-script",
+	"github__get_me",
+	"github__list_pull_requests",
+}
+
 // Server is a fake MetaMCP endpoint.
 type Server struct {
 	APIKey string
@@ -46,6 +62,7 @@ type Server struct {
 	live     map[string]bool
 	expired  map[string]bool
 	lastCode string
+	reauth   map[string]bool
 
 	Created     atomic.Int64 // sessions created (initialize responses)
 	Deleted     atomic.Int64 // DELETE requests for live sessions
@@ -61,8 +78,8 @@ type Server struct {
 
 // New starts a fake server requiring apiKey in X-API-Key.
 func New(apiKey string) *Server {
-	s := &Server{APIKey: apiKey, live: map[string]bool{}, expired: map[string]bool{}}
-	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "fake-metamcp", Version: "test"}, nil)
+	s := &Server{APIKey: apiKey, live: map[string]bool{}, expired: map[string]bool{}, reauth: map[string]bool{}}
+	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "fake-metamcp", Version: Version}, nil)
 	mcpServer.AddTool(&mcp.Tool{Name: "search_tools", InputSchema: objectSchema()}, s.search)
 	mcpServer.AddTool(&mcp.Tool{Name: "execute", InputSchema: objectSchema()}, s.execute)
 	mcpServer.AddTool(&mcp.Tool{Name: "external_tools", InputSchema: objectSchema()}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -98,6 +115,16 @@ func (s *Server) LiveSessions() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.live)
+}
+
+// RequireReauth makes calls to these tools fail like an upstream whose OAuth
+// grant needs renewing.
+func (s *Server) RequireReauth(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range names {
+		s.reauth[n] = true
+	}
 }
 
 // LastCode returns the most recent execute code.
@@ -267,7 +294,26 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 		return res
 	}
 
+	if rest, ok := strings.CutPrefix(args.Code, "const args = "); ok {
+		line, body, _ := strings.Cut(rest, "\n")
+		var in map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSuffix(line, ";")), &in); err != nil {
+			return fail("E_RUNTIME", "bad generated script: "+err.Error(), 0, 0, false), nil
+		}
+		res := asText(s.catalogScript(body, in))
+		res.Meta = meta(false, "success")
+		return res, nil
+	}
+
 	switch {
+	case strings.Contains(args.Code, "__MISSING_TOOL__"):
+		res := fail("E_TOOL_NOT_FOUND", "ChildCallError: "+unknownTool("VPS__run_script"), 1, 1, false)
+		var env map[string]any
+		_ = json.Unmarshal([]byte(res.Content[0].(*mcp.TextContent).Text), &env)
+		env["diagnostics"].([]any)[0].(map[string]any)["location"].(map[string]any)["tool"] = "VPS__run_script"
+		data, _ := json.Marshal(env)
+		res.Content[0] = &mcp.TextContent{Text: string(data)}
+		return res, nil
 	case strings.Contains(args.Code, "__THROW__"):
 		for i, line := range strings.Split(args.Code, "\n") {
 			if col := strings.Index(line, "__THROW__"); col >= 0 {
@@ -295,4 +341,120 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 	}
 	res.Meta = meta(false, "success")
 	return res, nil
+}
+
+func unknownTool(name string) string {
+	data, _ := json.Marshal(map[string]any{
+		"error":       "Unknown tool: " + name + ". The server is synced but this tool is not registered.",
+		"error_code":  "UNKNOWN_TOOL",
+		"error_class": "unknown_tool",
+	})
+	return string(data)
+}
+
+func category(name string) string {
+	c, _, _ := strings.Cut(name, "__")
+	return c
+}
+
+func strs(v any) []string {
+	var out []string
+	list, _ := v.([]any)
+	for _, x := range list {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func inCatalog(name string) bool {
+	for _, n := range Catalog {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func entry(name string, schema bool) map[string]any {
+	e := map[string]any{"name": name, "category": category(name), "summary": "Summary of " + name}
+	if schema {
+		e["inputSchema"] = map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}}
+		e["declaration"] = "tools." + category(name) + ".x(args: {}): Promise<unknown>"
+	}
+	return e
+}
+
+// catalogScript answers the scripts mcli generates, recognised by their body.
+func (s *Server) catalogScript(body string, args map[string]any) any {
+	switch {
+	case strings.Contains(body, "capabilities"): // doctor
+		cats := map[string]int{}
+		for _, n := range Catalog {
+			cats[category(n)]++
+		}
+		probes := []any{}
+		for _, raw := range args["probes"].([]any) {
+			name := raw.(map[string]any)["name"].(string)
+			s.mu.Lock()
+			reauth := s.reauth[name]
+			s.mu.Unlock()
+			switch {
+			case reauth:
+				msg, _ := json.Marshal(map[string]any{
+					"error": "Upstream server github requires re-authorization.", "error_code": "AUTH_REAUTHORIZATION_REQUIRED",
+					"error_class": "auth_invalid", "recovery": "Authorize this server again in MetaMCP, then retry.",
+					"authorization_url": "https://example.test/authorize/github",
+				})
+				probes = append(probes, map[string]any{"tool": name, "ok": false, "ms": 3, "code": "E_RUNTIME", "message": string(msg)})
+			case inCatalog(name):
+				probes = append(probes, map[string]any{"tool": name, "ok": true, "ms": 2})
+			default:
+				probes = append(probes, map[string]any{"tool": name, "ok": false, "ms": 1, "code": "E_TOOL_NOT_FOUND", "message": unknownTool(name)})
+			}
+		}
+		return map[string]any{
+			"tool_count": len(Catalog), "categories": cats, "probes": probes,
+			"capabilities": map[string]any{"tools_search": true, "list_declaration": true},
+		}
+	case strings.Contains(body, "args.variants"): // schema
+		items, existing := []any{}, []string{}
+		for _, n := range strs(args["names"]) {
+			if inCatalog(n) {
+				items = append(items, entry(n, true))
+				continue
+			}
+			variants, _ := args["variants"].(map[string]any)
+			for _, v := range strs(variants[n]) {
+				if inCatalog(v) {
+					existing = append(existing, v)
+				}
+			}
+		}
+		return map[string]any{"items": items, "existing": existing, "declaration": true}
+	case strings.Contains(body, "args.declaration"): // tools
+		cat, _ := args["category"].(string)
+		items, cats := []any{}, []string{}
+		for _, n := range Catalog {
+			if cat == "" || category(n) == cat {
+				items = append(items, entry(n, false))
+			}
+			if c := category(n); len(cats) == 0 || cats[len(cats)-1] != c {
+				cats = append(cats, c)
+			}
+		}
+		if cat != "" && len(items) == 0 {
+			return map[string]any{"items": items, "categories": cats}
+		}
+		return map[string]any{"items": items, "declaration": args["declaration"]}
+	default: // name lookup
+		found := []string{}
+		for _, n := range strs(args["names"]) {
+			if inCatalog(n) {
+				found = append(found, n)
+			}
+		}
+		return found
+	}
 }

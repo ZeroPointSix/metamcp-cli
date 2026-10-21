@@ -1,6 +1,6 @@
 # mcli — MetaMCP CLI
 
-让 Agent 在「能装 npm 包、但配不了 MCP」的环境里，通过终端使用 MetaMCP：一个 Go 单二进制，只有 `config / search / execute` 三个核心命令。工具发现、权限、审计、Hook、Code Mode 执行全部仍在 MetaMCP 服务端完成，mcli 只是一个普通的 MCP Streamable HTTP 客户端。
+让 Agent 在「能装 npm 包、但配不了 MCP」的环境里，通过终端使用 MetaMCP：一个 Go 单二进制，核心命令是 `config / search / execute`，另有 `tools / schema`（读目录、读 Schema 的快捷方式）和 `doctor`（端点自检）。工具发现、权限、审计、Hook、Code Mode 执行全部仍在 MetaMCP 服务端完成，mcli 只是一个普通的 MCP Streamable HTTP 客户端。
 
 ```text
 Agent / Shell
@@ -32,6 +32,7 @@ irm https://raw.githubusercontent.com/ZeroPointSix/metamcp-cli/main/install.ps1 
 - Linux / macOS 装到 `~/.local/bin/mcli`；Windows 装到 `%LOCALAPPDATA%\Programs\mcli\mcli.exe` 并加入用户 PATH。
 - 指定版本：`MCLI_VERSION=v0.1.0`；指定目录：`MCLI_INSTALL_DIR=...`（PowerShell 先 `$env:MCLI_VERSION='v0.1.0'`）。
 - 重复执行即升级；正在运行的 daemon 不受影响，下次调用时自动换成新版本。
+- 检查是否有新版本：`mcli version --check`（`update_available`、升级命令）；`mcli doctor` 也会顺带报告。
 
 也可以手动从 Releases 下载解压，或 `go install github.com/ZeroPointSix/metamcp-cli/cmd/mcli@latest`（Go 1.25+）。
 
@@ -63,7 +64,68 @@ return { login: me.login, githubTools: list.length };
 EOF
 ```
 
-`search` 原样透传 `{query, category, mode, limit, cursor, note}` 给 Facade `search_tools`；`execute` 只发送 `{code, timeout_ms, note}`，不暴露 `async` / `action`。
+`search` 原样透传 `{query, category, mode, limit, cursor, note}` 给 Facade `search_tools`；`execute` 只发送 `{code, timeout_ms, note}`，不暴露 `async` / `action`。长时间运行的上游操作由工具自身参数（如 `VPS__exec` 的 `expire_time_ms` / `kill_time_ms`）和 `--timeout` 控制。
+
+### 浏览目录、读 Schema
+
+`search_tools` 在服务端做检索排序，一次约 15–20 s；只想看「有哪些工具」或「某个工具的参数」时用下面两个命令，它们在沙箱里读缓存目录（`tools.list`），几秒返回：
+
+```bash
+mcli tools                              # 每个 server 及其工具名
+mcli tools --category VPS               # 该 server 的工具 + 一行摘要
+mcli tools --category github --declarations   # 再加 TypeScript 声明（需服务端支持）
+mcli schema VPS__exec                   # 完整 inputSchema / outputSchema（+ 声明）
+mcli schema VPS.run-script github__get_me     # 可一次多个；也接受 server.tool 写法
+```
+
+- 名字是逻辑名 `<server>__<tool>`，**原样复制**；很多名字带连字符，脚本里要写成 `tools.VPS["run-script"](args)`。
+- `tools.VPS` 是惰性 Proxy，`Object.keys(tools.VPS)` 永远是空数组；枚举请用 `mcli tools --category VPS` 或 `tools.list({ category: "VPS" })`。
+- 分类名不存在时（如 `vps`）返回 `E_TOOL_NOT_FOUND`，`hint` 列出端点上实际有的 server，`suggestions` 给出大小写/`_`/`-` 意义上最接近的那个。
+
+### 工具名纠错
+
+Agent 常把 `_` 和 `-` 混用（`VPS__run_script` → 实际是 `VPS__run-script`）。`execute` / `schema` / `doctor --probe` 遇到 `E_TOOL_NOT_FOUND` 时，CLI 会把名字里的 `_` 和 `-` 互换，查一次目录（只在这条失败路径上多一次 `tools.list`），把真实存在的名字写进 `error.suggestions`，`hint` 给出可直接复制的调用写法：
+
+```jsonc
+{"ok": false, "error": {"code": "E_TOOL_NOT_FOUND", "suggestions": ["VPS__run-script"],
+  "hint": "Did you mean \"VPS__run-script\"? Call it as tools.VPS[\"run-script\"](args) or tools.call(\"VPS__run-script\", args).", ...}}
+```
+
+### 端点自检：`mcli doctor`
+
+```bash
+mcli doctor                                         # 连通、鉴权、服务端版本、server 列表与工具数
+mcli doctor --expect github,VPS                     # 缺任何一个 server 就失败
+mcli doctor --expect github,VPS \
+  --probe github__get_me --probe VPS__list-profiles   # 对只读工具各调一次
+mcli doctor --probe 'VPS__exec={"command":"true"}'   # 需要参数时在 = 后给 JSON
+```
+
+doctor 总是自己开一个 MCP Session（不经过 daemon），报告：
+
+- `server`：`initialize` 返回的 `serverInfo.name/version` 与协商的协议版本；`latency_ms`；
+- `servers`：端点上每个 server（category）及工具数，`tool_count`；
+- `capabilities`：沙箱是否支持 `tools.search()`（`tools_search`）和 `tools.list({ declaration })`（`list_declaration`）——两者随 ZeroPointSix/metamcp-chatgpt#143 一起出现；
+- `expect.missing`：`--expect` 里缺的 server（大小写不对会提示 did you mean）；
+- `probes`：每个探测 `ok` / `auth_required`（上游需要在 MetaMCP 里重新授权，例如 `AUTH_REAUTHORIZATION_REQUIRED`，会带 `authorization_url`）/ `not_found`（带纠错建议）/ `timeout` / `error`；探测的返回值不会输出；
+- `cli`：当前版本、最新 Release、`update_available`（`MCLI_NO_UPDATE_CHECK=1` 跳过）。
+
+有缺失 server 或探测失败时以 `E_DOCTOR`（退出码 1）失败，完整报告仍在 `data`；连不上、Key 被拒等仍是原来的错误码（2/3/4）。**`--probe` 会真的调用工具，只能填只读工具。**
+
+### 发布与重启
+
+- **发布后冒烟**：`/health` 和容器 healthy 只说明进程起来了。把 `mcli doctor --expect <关键 server> --probe <只读工具>` 加进服务端发布脚本，在 `/health` 之后跑；非 0 退出就走脚本里已有的回滚：
+
+  ```bash
+  MCLI_NO_DAEMON=1 MCLI_NO_UPDATE_CHECK=1 mcli doctor --expect github,VPS,railway \
+    --probe github__get_me --probe VPS__list-profiles || rollback
+  ```
+
+- **服务端重启期间**：重启会让所有 MCP Session 失效。
+  - Session 被服务端忘掉（HTTP 404）的请求在执行前就被拒绝，CLI/daemon 自动重建 Session 并重试一次，调用方无感。
+  - `initialize` 阶段的 502/503 表示还没有任何工具运行；仍是退出码 4，但 `hint` 会说明「重试是安全的」。
+  - 已经送达、执行中途连接断开的 `execute` 返回 `E_NETWORK` / `E_SERVER` / `E_DAEMON`（退出码 4）：**结果不确定，先查目标状态**，不要盲目重跑写操作。
+- **能力随版本变化**：`mcli doctor` 的 `capabilities` 显示当前服务端支持的沙箱写法；脚本因为服务端过旧而用到 `tools.search` / `tools.list({ declaration })` 失败时，`hint` 会改为推荐 `mcli search` / `mcli tools` / `mcli schema`。
 
 ### 脚本契约
 
@@ -90,10 +152,12 @@ stdout **永远只有一个 JSON 对象**；stderr 只放给人看的提示。
  "diagnostics": [...], "trace": [...], "meta": {...}}
 ```
 
+`doctor` 和 `schema` 失败时也会带上 `data`（完整报告 / 已找到的工具）；`E_TOOL_NOT_FOUND` 可能带 `error.suggestions`。
+
 | 退出码 | 含义 | 典型错误码 |
 | --- | --- | --- |
 | 0 | 成功 | — |
-| 1 | 脚本或工具执行出错 | `E_RUNTIME`、`E_TOOL_NOT_FOUND`、`E_INVALID_ARGUMENT`、`E_FACADE`、`E_PROTOCOL`（含 `partial=true`） |
+| 1 | 脚本或工具执行出错 | `E_RUNTIME`、`E_TOOL_NOT_FOUND`、`E_INVALID_ARGUMENT`、`E_FACADE`、`E_PROTOCOL`（含 `partial=true`）、`E_DOCTOR`（自检发现问题） |
 | 2 | 用法 / 配置 / 本地预检失败 | `E_USAGE`、`E_CONFIG`、`E_SCRIPT_SYNTAX`、`E_SCRIPT_MODULE`、`E_SCRIPT_TOO_LARGE`、`E_NOT_METAMCP` |
 | 3 | 认证失败 | `E_AUTH`（HTTP 401/403） |
 | 4 | 超时或网络，**结果不确定** | `E_TIMEOUT`、`E_CHILD_TIMEOUT`、`E_CANCELLED`、`E_NETWORK`、`E_SERVER`（5xx）、`E_DAEMON` |
@@ -116,7 +180,7 @@ stdout **永远只有一个 JSON 对象**；stderr 只放给人看的提示。
 - **并发**：同一 Session 上最多 8 个在途请求。
 - **空闲退出**：默认 10 分钟无请求（`MCLI_DAEMON_IDLE=30m` 可调）→ DELETE Session → 删除 socket → 退出。日志在 `<runtime>/<id>.log`（>1 MB 轮转一次）。
 - **回退**：`--no-daemon` / `MCLI_NO_DAEMON=1`，或 daemon 无法就绪时，进程内一次性执行（initialize → tools/call → DELETE，Ctrl-C/SIGTERM 时也会发 DELETE）。只有请求**未送达** daemon 时才回退；已送达但连接中断的 execute 返回 `E_DAEMON`（退出码 4），避免重复写入。
-- 排障：`mcli daemon status`（pid、build、在途/已处理请求数、空闲剩余、Session 协议版本、重建次数）、`mcli daemon stop`。
+- 排障：`mcli daemon status`（pid、build、在途/已处理请求数、空闲剩余、Session 协议版本、服务端名称与版本、重建次数）、`mcli daemon stop`。
 
 ## 已核实的服务端事实（M0）
 
@@ -166,7 +230,7 @@ MCLI_BENCH=1 go test -run TestLatencyComparison -v ./test/e2e/
 MCLI_BENCH=1 MCLI_BENCH_URL=https://host/metamcp/<ep>/mcp MCLI_BENCH_API_KEY=... \
   go test -run TestLatencyComparison -v ./test/e2e/   # 对真实端点对比两种模式
 MCLI_LIVE_URL=https://host/metamcp/<ep>/mcp MCLI_LIVE_API_KEY=... \
-  go test -run TestLive -v ./test/e2e/                # 真实端点只读冒烟（8 项）
+  go test -run TestLive -v ./test/e2e/                # 真实端点只读冒烟（11 项）
 node npm/build.mjs 0.1.0            # 交叉编译 6 个平台并生成 npm 包到 npm/dist
 ```
 

@@ -1,4 +1,5 @@
-// Package cli wires the mcli commands: config, search, execute, plus the
+// Package cli wires the mcli commands: config, search, execute, the catalog
+// shortcuts tools and schema, doctor and version, plus the
 // troubleshooting `daemon status|stop` and the hidden `__daemon` entry point.
 package cli
 
@@ -25,6 +26,13 @@ Two commands do the work:
   search    find upstream tools (returns tool cards with TypeScript signatures)
   execute   run a TypeScript/JavaScript script that calls those tools on the server
 
+Shortcuts and checks:
+  tools     list tool names per server from the catalog (seconds; search takes ~20 s)
+  schema    print a tool's full input/output schema
+  doctor    check connectivity, auth, server version and which servers the
+            endpoint exposes (--expect github,VPS fails if one is missing)
+  version   print the version; --check compares with the latest release
+
 Setup (once):
   mcli config set --url https://host/metamcp/<endpoint>/mcp
   printf '%s' "$KEY" | mcli config set --api-key-stdin
@@ -41,7 +49,12 @@ Typical flow:
 Script contract (execute):
   - The file is a function body: use top-level await and "return" the result.
   - Call tools via tools.<server>.<tool>(args) or tools.call("server__tool", args);
-    read a tool's full input schema with tools.list({ names: [...], schema: true }).
+    read a tool's full input schema with "mcli schema server__tool" or
+    tools.list({ names: [...], schema: true }).
+  - Copy tool names exactly from search/tools output. Many contain "-" (VPS__run-script),
+    which needs bracket notation: tools.VPS["run-script"](args).
+  - tools.<server> is a lazy proxy: Object.keys(tools.VPS) is empty. Enumerate a
+    server's tools with tools.list({ category: "VPS" }) or "mcli tools --category VPS".
   - No import/export, npm packages, filesystem, network or timers. Types are
     stripped locally; the script runs in MetaMCP's sandbox, not on this machine.
   - console.log output is returned in the "console" field.
@@ -55,7 +68,8 @@ Exit codes:
   2 usage, configuration or local script check failed
   3 authentication failed
   4 timeout or network failure: the outcome is UNKNOWN. Inspect the target
-    state before retrying; never blindly re-run a write.
+    state before retrying; never blindly re-run a write. This includes
+    E_NETWORK/E_SERVER/E_DAEMON while the MetaMCP server restarts or deploys.
   5 a server limit was hit (call budget, output size, rate limit, busy)
 
 A background daemon keeps one MCP session alive between commands and exits
@@ -130,7 +144,8 @@ func (a *app) rootCommand() *cobra.Command {
 	pf.StringVar(&a.flagURL, "url", "", "endpoint URL for this invocation (overrides MCLI_URL and the config file)")
 	pf.BoolVar(&a.noDaemon, "no-daemon", false, "run in-process without the background daemon (same as MCLI_NO_DAEMON=1)")
 
-	root.AddCommand(a.configCommand(), a.searchCommand(), a.executeCommand(), a.daemonCommand(), a.internalDaemonCommand())
+	root.AddCommand(a.configCommand(), a.searchCommand(), a.executeCommand(), a.toolsCommand(), a.schemaCommand(),
+		a.doctorCommand(), a.versionCommand(), a.daemonCommand(), a.internalDaemonCommand())
 	return root
 }
 

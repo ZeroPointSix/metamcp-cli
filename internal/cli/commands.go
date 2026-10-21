@@ -157,10 +157,15 @@ func checkKey(s string) (string, error) {
 
 // verify checks that url is a MetaMCP endpoint accepting key.
 func verify(ctx context.Context, url, key string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(ctx, verifyTimeout)
-	defer cancel()
 	conn := mcpconn.New(mcpconn.Options{URL: url, APIKey: key})
 	defer conn.Close()
+	return verifyConn(ctx, conn)
+}
+
+// verifyConn connects conn and checks that it exposes the facade tools.
+func verifyConn(ctx context.Context, conn *mcpconn.Conn) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
 	names, err := conn.ListToolNames(ctx)
 	if err != nil {
 		return nil, err
@@ -232,12 +237,17 @@ func (a *app) executeCommand() *cobra.Command {
 The script is a function body: top-level await, "return" the result. Tools are
 reached only through the global "tools" object:
   await tools.<server>.<tool>(args)        // signature from "mcli search"
+  await tools.VPS["run-script"](args)      // names with "-" need brackets
   await tools.call("server__tool", args)
   await tools.list({ names: ["server__tool"], schema: true })  // full input schema
   await tools.list({ category: "github" })                      // browse one server
+Copy tool names exactly; on E_TOOL_NOT_FOUND the error lists the spellings
+that exist ("suggestions"). tools.<server> is a lazy proxy, so
+Object.keys(tools.VPS) is empty; enumerate with tools.list({ category }).
 Newer MetaMCP releases also offer tools.search(query) and
-tools.list({ declaration: true }) inside scripts; older ones reject them, so
-discover tools with "mcli search" first.
+tools.list({ declaration: true }) inside scripts; older ones reject them
+("mcli doctor" shows which the server supports), so discover tools with
+"mcli search", "mcli tools" or "mcli schema" first.
 Promise.all, loops and map/filter/reduce work. import/export, npm packages,
 filesystem, network and timers are not available. TypeScript types are
 stripped locally (single file, no bundling); the source limit is 256 KiB and
@@ -245,7 +255,14 @@ the transpiled code must fit the server's 64 KiB limit.
 
 Execution is not atomic: child tool calls may complete before a later failure
 ("meta.partial": true). On exit code 4 the outcome is unknown; inspect the
-target before re-running anything that writes.`,
+target before re-running anything that writes. That includes E_NETWORK,
+E_SERVER and E_DAEMON during a MetaMCP restart or deploy: the request may have
+run before the server went away. (A session the server merely forgot, HTTP
+404, is rebuilt and retried once automatically, because nothing ran.)
+
+Long-running upstream work (for example VPS exec) is bounded by the tool's own
+arguments (expire_time_ms / kill_time_ms) and by --timeout; raise both rather
+than wrapping the call in a retry loop.`,
 		Example: `  mcli execute task.ts
   mcli execute task.ts --timeout 2m --note "triage open PRs"
   mcli execute - <<'EOF'
@@ -273,6 +290,8 @@ target before re-running anything that writes.`,
 			args := ops.ExecuteArgs{Code: prepared.Code, TimeoutMS: int(timeout / time.Millisecond), Note: note}
 			res := a.run(cmd.Context(), cfg, ops.OpExecute, args, args.TimeoutMS)
 			remapPositions(res, prepared)
+			capabilityHint(res)
+			a.suggestToolNames(cmd.Context(), cfg, res)
 			return a.setResult(res)
 		},
 	}

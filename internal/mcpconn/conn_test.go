@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,6 +116,20 @@ func TestHTTPStatusClassification(t *testing.T) {
 			t.Errorf("HTTP %d: got %+v", status, r.Error)
 		}
 		srv.Close()
+	}
+}
+
+func TestServerErrorDuringInitializeSaysNothingRan(t *testing.T) {
+	srv := fakeserver.New("k")
+	defer srv.Close()
+	srv.FailStatus.Store(http.StatusBadGateway)
+	c := newConn(t, srv, "k")
+	r := ops.Execute(ctx(t), c, ops.ExecuteArgs{Code: "return 1;"})
+	if r.OK || r.Error.Code != output.CodeServer || !strings.HasPrefix(r.Error.Hint, "No tool ran") {
+		t.Fatalf("got %+v", r.Error)
+	}
+	if srv.Executes.Load() != 0 {
+		t.Error("execute must not have reached the server")
 	}
 }
 

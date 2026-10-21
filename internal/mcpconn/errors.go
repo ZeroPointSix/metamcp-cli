@@ -41,7 +41,12 @@ func classify(ctx context.Context, err error, rec *statusRecorder, connecting bo
 	case status == http.StatusNotFound && connecting:
 		return output.New(output.CodeConfig, "endpoint not found (HTTP 404): check the URL, it should look like https://host/metamcp/<endpoint>/mcp")
 	case status >= 500:
-		return output.Newf(output.CodeServer, "server error (HTTP %d): %v", status, err)
+		e := output.Newf(output.CodeServer, "server error (HTTP %d): %v", status, err)
+		if connecting {
+			// initialize failed: no tool ran, so the exit-4 hint would mislead.
+			e.Hint = "No tool ran: the server failed while the session was being set up. HTTP 502/503 usually means MetaMCP is restarting or deploying; retrying shortly is safe."
+		}
+		return e
 	case status >= 400:
 		return output.Newf(output.CodeProtocol, "unexpected HTTP %d: %v", status, err)
 	}

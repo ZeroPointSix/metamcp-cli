@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +16,7 @@ import (
 //	  go test -run TestLive -v ./test/e2e/
 //
 // Scripts only search, list catalogs and compute locally; no upstream tool
-// with side effects is called.
+// with side effects is called (doctor runs without --probe).
 func TestLive(t *testing.T) {
 	url, key := os.Getenv("MCLI_LIVE_URL"), os.Getenv("MCLI_LIVE_API_KEY")
 	if url == "" || key == "" {
@@ -68,6 +69,46 @@ func TestLive(t *testing.T) {
 		r := e.mustOK("const l: any = await tools.list({ category: \"github\" });\nreturn Array.isArray(l) ? l.length : -1;", "execute", "-")
 		if n, _ := r.json["data"].(float64); n <= 0 {
 			t.Errorf("tools.list returned %v", r.json["data"])
+		}
+	})
+
+	t.Run("doctor", func(t *testing.T) {
+		e.t = t
+		data := e.mustOK("", "doctor", "--expect", "github").json["data"].(map[string]any)
+		srv := data["server"].(map[string]any)
+		if srv["version"] == "" || data["tool_count"].(float64) <= 0 {
+			t.Errorf("doctor = %v", data)
+		}
+		t.Logf("server version=%v capabilities=%v", srv["version"], data["capabilities"])
+		r := e.run("", "doctor", "--expect", "mcli-live-no-such-server")
+		if r.exit != 1 || errCode(r) != "E_DOCTOR" {
+			t.Errorf("missing server: exit %d %s", r.exit, r.stdout)
+		}
+	})
+
+	t.Run("tools and schema", func(t *testing.T) {
+		e.t = t
+		data := e.mustOK("", "tools", "--category", "github").json["data"].(map[string]any)
+		list, _ := data["tools"].([]any)
+		if len(list) == 0 {
+			t.Fatalf("no github tools: %v", data)
+		}
+		name := list[0].(map[string]any)["name"].(string)
+		s := e.mustOK("", "schema", name).json["data"].(map[string]any)["tools"].([]any)
+		if len(s) != 1 || s[0].(map[string]any)["inputSchema"] == nil {
+			t.Errorf("schema %s = %v", name, s)
+		}
+	})
+
+	t.Run("unknown tool name gets suggestions", func(t *testing.T) {
+		e.t = t
+		// github__get_me exists; the hyphenated spelling does not. Nothing runs.
+		r := e.run("return await tools.github[\"get-me\"]({});", "execute", "-")
+		if r.exit != 1 || errCode(r) != "E_TOOL_NOT_FOUND" {
+			t.Fatalf("exit %d %s", r.exit, r.stdout)
+		}
+		if s := r.json["error"].(map[string]any)["suggestions"]; fmt.Sprint(s) != "[github__get_me]" {
+			t.Errorf("suggestions = %v", s)
 		}
 	})
 
