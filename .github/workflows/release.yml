@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual releases: Actions creates the tag itself, then builds it.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to create and release, e.g. v0.1.0 or v0.2.0-rc.1"
+        required: true
 
 permissions:
   contents: write
@@ -14,6 +20,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Create the tag (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "version must look like v1.2.3 or v1.2.3-rc.1"; exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "mcli $VERSION"
+          git push origin "$VERSION"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -28,8 +46,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: github-release
     if: ${{ vars.NPM_PUBLISH == 'true' }}
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -37,14 +59,14 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: node npm/build.mjs "${GITHUB_REF_NAME}" "$RUNNER_TEMP/npm"
+      - run: node npm/build.mjs "$VERSION" "$RUNNER_TEMP/npm"
       - name: Publish (platform packages first, launcher last)
         # Prereleases (v1.2.3-rc.1) go to the "next" dist-tag, releases to
         # "latest". Versions already on the registry are skipped, so a failed
         # run can simply be re-run.
         run: |
           tag=latest
-          case "$GITHUB_REF_NAME" in *-*) tag=next ;; esac
+          case "$VERSION" in *-*) tag=next ;; esac
           for d in "$RUNNER_TEMP"/npm/mcli-* "$RUNNER_TEMP"/npm/mcli; do
             spec="$(node -p "const p=require('$d/package.json'); p.name+'@'+p.version")"
             if npm view "$spec" version >/dev/null 2>&1; then

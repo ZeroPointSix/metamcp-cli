@@ -1,6 +1,6 @@
 # 发布 mcli
 
-一次发布 = 推一个 `v*` tag。`release.yml` 会：
+一次发布 = 推一个 `v*` tag，或在 GitHub 的 Actions → Release → Run workflow 里填入版本号（如 `v0.2.0`），由 Actions 自己创建 tag。`release.yml` 会：
 
 1. **GitHub Release（主渠道）**：GoReleaser 交叉编译 6 个目标（linux / darwin / windows × amd64 / arm64），上传 `mcli_<os>_<arch>.tar.gz|zip` 和 `checksums.txt`。文件名不带版本号，`install.sh` / `install.ps1` 直接从 `releases/latest/download/` 取最新版。`-rc.N` 之类的 tag 自动标为 pre-release，不会被 latest 选中。
 2. **npm（可选）**：仓库变量 `NPM_PUBLISH=true` 且配置了 `NPM_TOKEN` 时，再发布 `@zeropointsix/mcli` 及 6 个平台包；预发布进 `next`，正式版进 `latest`，已存在的版本自动跳过。不配置则跳过这一步。
