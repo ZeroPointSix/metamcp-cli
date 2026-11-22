@@ -57,6 +57,8 @@ mcli config show                                       # Key 只显示末 4 位
 mcli search github pull request            # 多个词自动拼成一个查询
 mcli search "send email" --limit 10 --category gmail --mode keyword
 mcli execute task.ts --timeout 2m --note "整理本周 PR"
+mcli execute -e 'return await tools.github.get_me({})'   # 短脚本，免 heredoc
+mcli execute task.ts --out result.json                    # data 一律写文件
 mcli execute - <<'EOF'
 const me = await tools.github.get_me({});
 const list = await tools.list({ category: "github" });
@@ -137,16 +139,24 @@ doctor 总是自己开一个 MCP Session（不经过 daemon），报告：
 - 本地预检（不发请求，退出码 2）：import/export（给出正确写法提示）、语法错误（行号已去掉包装偏移）、源码 > 256 KiB、转译后 > 64 KiB。
 - 服务端报错的 `location.line/column` 相对于提交的代码；CLI 用 esbuild sourcemap 换算回你的源文件行列，并在 `error.message` 里附上 `file:line: 源码`。
 - 注意 esbuild 会去掉注释，脚本里依赖注释的内容不会到达服务端。
+- **参数预检**：执行前，CLI 从脚本里静态找出直接传对象字面量的调用（`tools.x.y({ ... })`、`tools.x["y"]({ ... })`、`tools.call("x__y", { ... })`），读一次这些工具的 Schema，把 Schema 里没有的顶层参数名（`W_UNKNOWN_ARGUMENT`，带近似名 `suggestion`）和缺少的必填参数（`W_MISSING_ARGUMENT`）放进结果的 `warnings`。很多上游工具会静默忽略不认识的参数，写错名字往往表现为"成功但返回全量数据"。默认只提示不拦截；`--strict-args` 发现问题时不执行（退出码 2）；`MCLI_ARG_CHECK=0` 关闭。传变量（`tools.x.y(args)`）的调用不检查。
+- 脚本没有 `return`、只用 `console.log` 打印时，`data` 为 `null`，结果会带 `W_NO_RETURN` 提示。
 
 ## 输出与退出码
 
-stdout **永远只有一个 JSON 对象**；stderr 只放给人看的提示。
+stdout **永远只有一个 JSON 对象**；stderr 只放给人看的一行提示（失败时为 `mcli: <code>: <message 首行，最长约 200 字节>`，完整错误在 stdout）。
+
+- **格式**：stdout 是终端时缩进输出；管道、Agent 执行器等非 TTY 场景输出紧凑单行 JSON。`MCLI_OUTPUT=pretty|compact` 可强制指定。
+- **大结果落盘**：`data` 或 `console` 超过 64 KiB（`MCLI_MAX_OUTPUT` 字节数，`0` 关闭）时写入文件（`MCLI_OUTPUT_DIR`，默认系统临时目录下的 `mcli-output/`，文件 0600），stdout 改为 `"data_file": {"path", "bytes", "preview"}` / `"console_file"`，不再带 `data` / `console`。`execute --out <file>` 无论大小都写到指定文件。落盘的数据文件就是 `data` 本身的 JSON，可直接 `jq`。
+- **嵌套错误拍平**：外部工具本身也是 Code Mode 脚本时，子调用失败会以 `ChildCallError: {完整诊断信封}` 的形式层层嵌套。mcli 把 `error.message` 和 `diagnostics[].message` 拍平到最内层错误，最内层失败的工具名放在 `error.tool`，并去掉诊断里的沙箱 `stack`。
 
 ```jsonc
 // search 成功
 {"ok": true, "data": {"tools": [...], "count": 1, "total": 29, "next_cursor": "Mg=="}}
 // execute 成功
-{"ok": true, "data": <return 的值>, "console": "...", "meta": {"trace_id": "...", "partial": false, "child_successes": 3, "child_failures": 0}}
+{"ok": true, "data": <return 的值>, "console": "...", "warnings": [...], "meta": {"trace_id": "...", "partial": false, "child_successes": 3, "child_failures": 0}}
+// execute 成功但结果过大（或 --out）
+{"ok": true, "data_file": {"path": "/tmp/mcli-output/20261122-092650-123.json", "bytes": 837476, "preview": "{\"entities\":[..."}, "meta": {...}}
 // 失败
 {"ok": false, "error": {"code": "E_RUNTIME", "message": "...", "trace_id": "...", "line": 4, "column": 7, "hint": "...", "exit": 1},
  "diagnostics": [...], "trace": [...], "meta": {...}}
@@ -161,7 +171,7 @@ stdout **永远只有一个 JSON 对象**；stderr 只放给人看的提示。
 | 2 | 用法 / 配置 / 本地预检失败 | `E_USAGE`、`E_CONFIG`、`E_SCRIPT_SYNTAX`、`E_SCRIPT_MODULE`、`E_SCRIPT_TOO_LARGE`、`E_NOT_METAMCP` |
 | 3 | 认证失败 | `E_AUTH`（HTTP 401/403） |
 | 4 | 超时或网络，**结果不确定** | `E_TIMEOUT`、`E_CHILD_TIMEOUT`、`E_CANCELLED`、`E_NETWORK`、`E_SERVER`（5xx）、`E_DAEMON` |
-| 5 | 触及服务端限制 | `E_CALL_LIMIT`、`E_OUTPUT_LIMIT`、`E_MEMORY_LIMIT`、`E_TOOL_LIST_TOO_LARGE`、`E_RATE_LIMITED`（429）、`E_CAPACITY`（Code Mode 池满） |
+| 5 | 触及服务端限制或上游暂不可用，稍后重试 | `E_CALL_LIMIT`、`E_OUTPUT_LIMIT`、`E_MEMORY_LIMIT`、`E_TOOL_LIST_TOO_LARGE`、`E_RATE_LIMITED`（429）、`E_CAPACITY`（Code Mode 池满）、`E_UPSTREAM_UNAVAILABLE`（MetaMCP 对该上游熔断/限流，调用未转发） |
 
 退出码 4 的 `hint` 会明确告诉 Agent：先检查目标状态再决定是否重试，不要盲目重跑写操作。
 

@@ -226,13 +226,16 @@ before calling the tool; do not guess omitted arguments.`,
 
 func (a *app) executeCommand() *cobra.Command {
 	var (
-		timeout time.Duration
-		note    string
+		timeout    time.Duration
+		note       string
+		eval       string
+		strictArgs bool
 	)
 	cmd := &cobra.Command{
-		Use:   "execute <file.ts|file.js|->",
+		Use:   "execute <file.ts|file.js|-> | -e <code>",
 		Short: "Run a TypeScript/JavaScript tool script on the server",
-		Long: `Run a script in MetaMCP's Code Mode sandbox. "-" reads the script from stdin.
+		Long: `Run a script in MetaMCP's Code Mode sandbox. "-" reads the script from stdin;
+-e/--eval takes short code inline, which avoids heredoc quoting.
 
 The script is a function body: top-level await, "return" the result. Tools are
 reached only through the global "tools" object:
@@ -262,22 +265,52 @@ run before the server went away. (A session the server merely forgot, HTTP
 
 Long-running upstream work (for example VPS exec) is bounded by the tool's own
 arguments (expire_time_ms / kill_time_ms) and by --timeout; raise both rather
-than wrapping the call in a retry loop.`,
+than wrapping the call in a retry loop.
+
+Before running, mcli compares the top-level argument names of literal calls
+(tools.x.y({ ... }), tools.call("x__y", { ... })) with each tool's input
+schema and reports unknown or missing names in "warnings": many tools silently
+ignore an argument they do not know. --strict-args refuses to run instead;
+MCLI_ARG_CHECK=0 turns the check off.
+
+Large results: when data or console output exceeds 64 KiB (MCLI_MAX_OUTPUT,
+0 = never) it is written to a file and stdout carries "data_file" /
+"console_file" with the path, size and a preview. --out always writes data to
+the given file.`,
 		Example: `  mcli execute task.ts
+  mcli execute -e 'return await tools.github.get_me({})'
+  mcli execute task.ts --out result.json
   mcli execute task.ts --timeout 2m --note "triage open PRs"
   mcli execute - <<'EOF'
   const me = await tools.github.get_me({});
   const list = await tools.list({ category: "github" });
   return { login: me.login, githubTools: list.length };
   EOF`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, files []string) error {
 			if timeout <= 0 {
 				return output.New(output.CodeUsage, "--timeout must be positive")
 			}
-			src, name, err := script.Read(files[0], a.stdin)
-			if err != nil {
-				return a.setResult(output.Fail(err))
+			var (
+				src  []byte
+				name string
+				err  error
+			)
+			switch {
+			case cmd.Flags().Changed("eval") && len(files) > 0:
+				return output.New(output.CodeUsage, "pass either a script file (or -) or -e <code>, not both")
+			case cmd.Flags().Changed("eval"):
+				src, name = []byte(eval), "eval.ts"
+				if len(src) > script.MaxSourceBytes {
+					return a.setResult(output.Fail(output.Newf(output.CodeScriptTooLarge, "script exceeds the %d KiB source limit", script.MaxSourceBytes>>10)))
+				}
+			case len(files) == 0:
+				return output.New(output.CodeUsage, "missing script: pass a file, - for stdin, or -e <code>")
+			default:
+				src, name, err = script.Read(files[0], a.stdin)
+				if err != nil {
+					return a.setResult(output.Fail(err))
+				}
 			}
 			prepared, err := script.Prepare(src, name)
 			if err != nil {
@@ -287,16 +320,29 @@ than wrapping the call in a retry loop.`,
 			if err != nil {
 				return a.setResult(output.Fail(err))
 			}
+			warnings := a.checkArgs(cmd.Context(), cfg, string(src))
+			if strictArgs && len(warnings) > 0 {
+				e := output.New(output.CodeUsage, "argument check failed; the script was not run")
+				e.Hint = "Fix the argument names listed in warnings (see `mcli schema <server__tool>`), or drop --strict-args."
+				res := output.Fail(e)
+				res.Warnings = warnings
+				return a.setResult(res)
+			}
 			args := ops.ExecuteArgs{Code: prepared.Code, TimeoutMS: int(timeout / time.Millisecond), Note: note}
 			res := a.run(cmd.Context(), cfg, ops.OpExecute, args, args.TimeoutMS)
 			remapPositions(res, prepared)
 			capabilityHint(res)
 			a.suggestToolNames(cmd.Context(), cfg, res)
+			res.Warnings = append(warnings, res.Warnings...)
+			noReturnWarning(res, string(src))
 			return a.setResult(res)
 		},
 	}
 	cmd.Flags().DurationVar(&timeout, "timeout", ops.DefaultExecuteTimeout, "server-side execution timeout")
 	cmd.Flags().StringVar(&note, "note", "", "one-line intent recorded in the audit log (no secrets)")
+	cmd.Flags().StringVarP(&eval, "eval", "e", "", "run this code instead of a script file")
+	cmd.Flags().StringVar(&a.outPath, "out", "", "write data to this file; stdout gets its path, size and a preview")
+	cmd.Flags().BoolVar(&strictArgs, "strict-args", false, "do not run when the argument check finds unknown or missing arguments")
 	return cmd
 }
 

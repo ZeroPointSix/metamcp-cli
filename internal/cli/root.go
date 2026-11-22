@@ -10,8 +10,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -41,6 +44,7 @@ Setup (once):
 Typical flow:
   mcli search "github pull request"
   mcli execute task.ts
+  mcli execute -e 'return await tools.github.get_me({})'
   mcli execute - <<'EOF'
   const prs = await tools.github.list_pull_requests({ owner: "o", repo: "r" });
   return prs;
@@ -60,7 +64,12 @@ Script contract (execute):
   - console.log output is returned in the "console" field.
 
 Output: stdout carries exactly one JSON object, {"ok": true, "data": ...} or
-{"ok": false, "error": {"code", "message", "hint", ...}}. Diagnostics go to stderr.
+{"ok": false, "error": {"code", "message", "hint", ...}}, on one line unless
+stdout is a terminal (MCLI_OUTPUT=pretty|compact overrides). Read "warnings"
+first: W_UNKNOWN_ARGUMENT means a tool was given an argument name it does not
+know and probably ignored it. Data or console output over 64 KiB
+(MCLI_MAX_OUTPUT) goes to a file; stdout then has "data_file"/"console_file"
+with its path, size and a preview. stderr gets a one-line summary for people.
 
 Exit codes:
   0 success
@@ -70,7 +79,9 @@ Exit codes:
   4 timeout or network failure: the outcome is UNKNOWN. Inspect the target
     state before retrying; never blindly re-run a write. This includes
     E_NETWORK/E_SERVER/E_DAEMON while the MetaMCP server restarts or deploys.
-  5 a server limit was hit (call budget, output size, rate limit, busy)
+  5 a server limit was hit (call budget, output size, rate limit, busy) or
+    an upstream server is temporarily unavailable (E_UPSTREAM_UNAVAILABLE:
+    the call was not forwarded); retry later
 
 A background daemon keeps one MCP session alive between commands and exits
 after 10 idle minutes (MCLI_DAEMON_IDLE). --no-daemon or MCLI_NO_DAEMON=1 runs
@@ -82,6 +93,8 @@ type app struct {
 
 	flagURL  string
 	noDaemon bool
+	// outPath is execute --out: always write data to this file.
+	outPath string
 
 	// result is set by commands that produce JSON output.
 	result *output.Result
@@ -115,12 +128,87 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return a.exit
 	}
 	if !a.result.OK && a.result.Error != nil {
-		fmt.Fprintf(stderr, "mcli: %s\n", a.result.Error.Error())
+		fmt.Fprintf(stderr, "mcli: %s\n", summaryLine(a.result.Error))
 	}
-	if err := output.Print(stdout, a.result); err != nil {
+	a.spill()
+	if err := output.Print(stdout, a.result, prettyOutput(stdout)); err != nil {
 		return output.ExitFailure
 	}
 	return a.result.ExitCode()
+}
+
+// stderrMax bounds the one-line error summary on stderr; the full error is in
+// the JSON on stdout.
+const stderrMax = 200
+
+// summaryLine is "CODE: first line of the message", cut to stderrMax bytes.
+func summaryLine(e *output.Error) string {
+	line, _, _ := strings.Cut(e.Error(), "\n")
+	if len(line) > stderrMax {
+		cut := stderrMax
+		for cut > 0 && !utf8.RuneStart(line[cut]) {
+			cut--
+		}
+		line = line[:cut] + "…"
+	}
+	return line
+}
+
+// prettyOutput indents JSON for terminals only; pipes and agents get one
+// compact line. MCLI_OUTPUT=pretty|compact overrides the detection.
+func prettyOutput(w io.Writer) bool {
+	switch strings.ToLower(os.Getenv(config.EnvOutput)) {
+	case "pretty":
+		return true
+	case "compact":
+		return false
+	}
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// defaultMaxOutput is the stdout budget for data or console before they are
+// written to a file instead: agent terminals truncate long output.
+const defaultMaxOutput = 64 << 10
+
+func maxOutput() int {
+	v := os.Getenv(config.EnvMaxOutput)
+	if v == "" {
+		return defaultMaxOutput
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return defaultMaxOutput
+	}
+	return n // 0 disables spilling
+}
+
+func spillDir() string {
+	if d := os.Getenv(config.EnvOutputDir); d != "" {
+		return d
+	}
+	return filepath.Join(os.TempDir(), "mcli-output")
+}
+
+// spill writes data (always with --out, else when it is over the budget) and
+// an oversized console to files, leaving a path, size and preview on stdout.
+func (a *app) spill() {
+	r := a.result
+	limit := maxOutput()
+	if a.outPath != "" || (limit > 0 && len(r.Data) > limit) {
+		if err := r.SpillData(a.outPath, spillDir()); err != nil {
+			fmt.Fprintf(a.stderr, "mcli: could not write data to a file, printing it instead: %v\n", err)
+		}
+	}
+	if limit > 0 && len(r.Console) > limit {
+		if err := r.SpillConsole(spillDir()); err != nil {
+			fmt.Fprintf(a.stderr, "mcli: could not write console output to a file: %v\n", err)
+		}
+	}
 }
 
 func (a *app) rootCommand() *cobra.Command {

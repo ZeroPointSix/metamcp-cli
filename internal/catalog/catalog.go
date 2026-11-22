@@ -118,6 +118,9 @@ func Script(body string, v any) (string, error) {
 // LookupScript resolves which of args.names exist.
 const LookupScript = `return (await tools.list({ names: args.names })).map((t) => t.name);`
 
+// ArgSchemaScript reads the input schemas behind the argument check.
+const ArgSchemaScript = `return (await tools.list({ names: args.names, schema: true })).map((t) => ({ name: t.name, inputSchema: t.inputSchema }));`
+
 // ToolsScript lists the catalog, optionally one category with summaries and
 // declarations. An unknown category returns the categories that do exist.
 const ToolsScript = `
