@@ -2,10 +2,13 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func warningCodes(r result) []string {
@@ -87,8 +90,9 @@ func TestUpstreamOutageIsFlattenedAndRetryable(t *testing.T) {
 	}
 	errObj := r.json["error"].(map[string]any)
 	msg := errObj["message"].(string)
-	if !strings.Contains(msg, "Upstream MCP is temporarily unavailable") || strings.Contains(msg, "{") {
-		t.Errorf("message not flattened: %q", msg)
+	if !strings.Contains(msg, "Upstream MCP is temporarily unavailable") || strings.Contains(msg, "{") ||
+		strings.Count(msg, "ChildCallError") > 1 {
+		t.Errorf("message not flattened exactly once: %q", msg)
 	}
 	if errObj["tool"] != "maton__run_action" || !strings.Contains(errObj["hint"].(string), "Retry") {
 		t.Errorf("error = %v", errObj)
@@ -145,5 +149,77 @@ func TestNoReturnWarning(t *testing.T) {
 	r = e.mustOK("", "execute", "-e", "console.log('__NO_RETURN__'); return null;")
 	if got := warningCodes(r); len(got) != 0 {
 		t.Errorf("an explicit return null must not warn: %s", r.stdout)
+	}
+}
+
+func TestOutFileFailureIsAnError(t *testing.T) {
+	e := newEnv(t)
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "new", "dir", "r.json")
+	if r := e.mustOK("", "execute", "-e", "return 1;", "-o", nested); r.json["data_file"].(map[string]any)["path"] != nested {
+		t.Errorf("-o into a new directory: %s", r.stdout)
+	}
+	blocker := filepath.Join(dir, "file")
+	os.WriteFile(blocker, []byte("x"), 0o600)
+	r := e.run("", "execute", "-e", "return 1;", "--out", filepath.Join(blocker, "r.json"))
+	if r.exit != 2 || errCode(r) != "E_OUT_FILE" || r.json["data"] == nil {
+		t.Errorf("unwritable --out: exit %d %s", r.exit, r.stdout)
+	}
+	if !strings.Contains(r.json["error"].(map[string]any)["hint"].(string), "DID run") {
+		t.Errorf("hint must say the script ran: %s", r.stdout)
+	}
+}
+
+func TestDefaultSpillDirIsPrivateAndPruned(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the default directory is under the per-user cache dir on Windows")
+	}
+	tmp := t.TempDir()
+	e := newEnv(t, "MCLI_MAX_OUTPUT=10", "TMPDIR="+tmp, "MCLI_OUTPUT_DIR=")
+	dir := filepath.Join(tmp, fmt.Sprintf("mcli-output-%d", os.Getuid()))
+	os.MkdirAll(dir, 0o700)
+	old := filepath.Join(dir, "20200101-000000-1.json")
+	os.WriteFile(old, []byte("{}"), 0o600)
+	stale := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(old, stale, stale)
+	keep := filepath.Join(dir, "notes.txt")
+	os.WriteFile(keep, []byte("x"), 0o600)
+	os.Chtimes(keep, stale, stale)
+
+	r := e.mustOK("", "execute", "-e", "return 1;")
+	path := r.json["data_file"].(map[string]any)["path"].(string)
+	if filepath.Dir(path) != dir {
+		t.Errorf("spilled to %s, want %s", path, dir)
+	}
+	if st, err := os.Stat(dir); err != nil || st.Mode().Perm() != 0o700 {
+		t.Errorf("spill dir mode: %v %v", st.Mode(), err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("spill files older than a day should be pruned")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("files mcli did not create must not be pruned")
+	}
+}
+
+func TestStrictArgsOverridesEnvAndFailsClosed(t *testing.T) {
+	src := "return await tools.VPS.exec({ comand: \"ls\" });"
+	e := newEnv(t, "MCLI_ARG_CHECK=0")
+	if r := e.run("", "execute", "-e", src, "--strict-args"); r.exit != 2 || errCode(r) != "E_USAGE" {
+		t.Errorf("--strict-args with MCLI_ARG_CHECK=0: exit %d %s", r.exit, r.stdout)
+	}
+
+	f := newEnv(t)
+	f.srv.FailArgCheck.Store(true)
+	before := f.srv.Executes.Load()
+	if r := f.run("", "execute", "-e", src, "--strict-args"); r.exit != 5 || errCode(r) != "E_ARG_CHECK" {
+		t.Errorf("strict with failed lookup: exit %d %s", r.exit, r.stdout)
+	}
+	if got := f.srv.Executes.Load() - before; got != 1 {
+		t.Errorf("strict with failed lookup ran %d executes, want only the lookup", got)
+	}
+	r := f.mustOK("", "execute", "-e", src)
+	if got := warningCodes(r); len(got) != 1 || got[0] != "W_ARG_CHECK_SKIPPED" {
+		t.Errorf("non-strict failed lookup: %s", r.stdout)
 	}
 }

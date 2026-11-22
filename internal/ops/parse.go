@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -63,16 +64,14 @@ func payload(res *mcp.CallToolResult) (json.RawMessage, string, bool) {
 	return data, console, true
 }
 
+// compact removes insignificant whitespace without decoding: a round trip
+// through any would turn large integers into float64 and reorder keys.
 func compact(s string) json.RawMessage {
-	var v any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, []byte(s)); err != nil {
 		return json.RawMessage(s)
 	}
-	data, err := json.Marshal(v)
-	if err != nil {
-		return json.RawMessage(s)
-	}
-	return data
+	return buf.Bytes()
 }
 
 // facadeError recognises {"error": "..."} payloads.
@@ -305,7 +304,7 @@ func fromEnvelope(env *envelope, meta *output.Meta, console string) *output.Resu
 		}
 	}
 	if flat, inner := flatten(message); flat != message {
-		message = childErrorPrefix + flat
+		message = flat
 		if inner != "" {
 			tool = inner
 		}

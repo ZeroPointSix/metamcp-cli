@@ -66,15 +66,16 @@ type Server struct {
 	lastCode string
 	reauth   map[string]bool
 
-	Created     atomic.Int64 // sessions created (initialize responses)
-	Deleted     atomic.Int64 // DELETE requests for live sessions
-	Orphans     atomic.Int64 // session-less POSTs that were not initialize
-	Searches    atomic.Int64
-	Executes    atomic.Int64
-	Cancelled   atomic.Int64 // execute handlers that saw ctx cancellation
-	ArgChecks   atomic.Int64 // argument-check schema lookups
-	inFlight    atomic.Int64
-	MaxInFlight atomic.Int64
+	Created      atomic.Int64 // sessions created (initialize responses)
+	Deleted      atomic.Int64 // DELETE requests for live sessions
+	Orphans      atomic.Int64 // session-less POSTs that were not initialize
+	Searches     atomic.Int64
+	Executes     atomic.Int64
+	Cancelled    atomic.Int64 // execute handlers that saw ctx cancellation
+	ArgChecks    atomic.Int64 // argument-check schema lookups
+	FailArgCheck atomic.Bool  // make argument-check schema lookups fail
+	inFlight     atomic.Int64
+	MaxInFlight  atomic.Int64
 	// FailStatus, when non-zero, answers every POST with this HTTP status.
 	FailStatus atomic.Int32
 }
@@ -297,6 +298,9 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 		return res
 	}
 
+	if s.FailArgCheck.Load() && strings.Contains(args.Code, "inputSchema") {
+		return fail("E_RUNTIME", "catalog unavailable", 0, 0, false), nil
+	}
 	if rest, ok := strings.CutPrefix(args.Code, "const args = "); ok {
 		line, body, _ := strings.Cut(rest, "\n")
 		var in map[string]any

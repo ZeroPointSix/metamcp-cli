@@ -3,9 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
-	"regexp"
 	"strconv"
 	"time"
 
@@ -20,15 +18,17 @@ import (
 const argCheckTimeout = 10 * time.Second
 
 // checkArgs compares literal tool-call arguments in src with the tools'
-// schemas. It costs one catalog read, only when src has such calls, and
-// never fails the command: on any problem it reports nothing.
-func (a *app) checkArgs(ctx context.Context, cfg *config.Resolved, src string) []json.RawMessage {
-	if v, err := strconv.ParseBool(os.Getenv(config.EnvArgCheck)); err == nil && !v {
-		return nil
+// schemas. It costs one catalog read, only when src has such calls. When the
+// schemas cannot be read it adds a W_ARG_CHECK_SKIPPED warning and lets the
+// script run, except under strict, where it returns an error instead: a
+// strict check that did not happen must not pass.
+func (a *app) checkArgs(ctx context.Context, cfg *config.Resolved, src string, strict bool) ([]json.RawMessage, *output.Error) {
+	if v, err := strconv.ParseBool(os.Getenv(config.EnvArgCheck)); err == nil && !v && !strict {
+		return nil, nil
 	}
 	calls := argcheck.Extract(src)
 	if len(calls) == 0 {
-		return nil
+		return nil, nil
 	}
 	res := a.runScript(ctx, cfg, catalog.ArgSchemaScript, map[string]any{"names": argcheck.Tools(calls)}, argCheckTimeout, "mcli: argument check")
 	var items []struct {
@@ -36,8 +36,19 @@ func (a *app) checkArgs(ctx context.Context, cfg *config.Resolved, src string) [
 		InputSchema json.RawMessage `json:"inputSchema"`
 	}
 	if !res.OK || decode(res, &items) != nil {
-		fmt.Fprintln(a.stderr, "mcli: argument check skipped (could not read tool schemas)")
-		return nil
+		reason := "unexpected schema lookup result"
+		if res.Error != nil {
+			reason = res.Error.Error()
+		}
+		if strict {
+			return nil, output.Newf(output.CodeArgCheck, "argument check could not read tool schemas: %s", reason)
+		}
+		w, _ := json.Marshal(struct {
+			Severity string `json:"severity"`
+			Code     string `json:"code"`
+			Message  string `json:"message"`
+		}{"warning", "W_ARG_CHECK_SKIPPED", "Argument names were not checked: could not read tool schemas (" + reason + ")."})
+		return []json.RawMessage{w}, nil
 	}
 	schemas := map[string]argcheck.Schema{}
 	for _, it := range items {
@@ -51,16 +62,14 @@ func (a *app) checkArgs(ctx context.Context, cfg *config.Resolved, src string) [
 			out = append(out, data)
 		}
 	}
-	return out
+	return out, nil
 }
-
-var returnKeyword = regexp.MustCompile(`\breturn\b`)
 
 // noReturnWarning flags the common slip of printing a result with
 // console.log instead of returning it: data is then null and the value only
 // exists as text in "console".
 func noReturnWarning(res *output.Result, src string) {
-	if !res.OK || res.Console == "" || string(res.Data) != "null" || returnKeyword.MatchString(src) {
+	if !res.OK || res.Console == "" || string(res.Data) != "null" || argcheck.HasTopLevelReturn(src) {
 		return
 	}
 	w, _ := json.Marshal(struct {

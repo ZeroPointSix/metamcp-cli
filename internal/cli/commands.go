@@ -320,7 +320,10 @@ the given file.`,
 			if err != nil {
 				return a.setResult(output.Fail(err))
 			}
-			warnings := a.checkArgs(cmd.Context(), cfg, string(src))
+			warnings, abort := a.checkArgs(cmd.Context(), cfg, string(src), strictArgs)
+			if abort != nil {
+				return a.setResult(output.Fail(abort))
+			}
 			if strictArgs && len(warnings) > 0 {
 				e := output.New(output.CodeUsage, "argument check failed; the script was not run")
 				e.Hint = "Fix the argument names listed in warnings (see `mcli schema <server__tool>`), or drop --strict-args."
@@ -341,8 +344,8 @@ the given file.`,
 	cmd.Flags().DurationVar(&timeout, "timeout", ops.DefaultExecuteTimeout, "server-side execution timeout")
 	cmd.Flags().StringVar(&note, "note", "", "one-line intent recorded in the audit log (no secrets)")
 	cmd.Flags().StringVarP(&eval, "eval", "e", "", "run this code instead of a script file")
-	cmd.Flags().StringVar(&a.outPath, "out", "", "write data to this file; stdout gets its path, size and a preview")
-	cmd.Flags().BoolVar(&strictArgs, "strict-args", false, "do not run when the argument check finds unknown or missing arguments")
+	cmd.Flags().StringVarP(&a.outPath, "out", "o", "", "write data to this file; stdout gets its path, size and a preview")
+	cmd.Flags().BoolVar(&strictArgs, "strict-args", false, "do not run when the argument check finds unknown or missing arguments, or cannot run (overrides MCLI_ARG_CHECK=0)")
 	return cmd
 }
 

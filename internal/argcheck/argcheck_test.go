@@ -81,3 +81,53 @@ func TestClosest(t *testing.T) {
 		}
 	}
 }
+
+func TestZeroArgumentSchemaIsClosed(t *testing.T) {
+	closed := schema(t, `{"type":"object","properties":{},"additionalProperties":false}`)
+	if closed.Open {
+		t.Fatal("additionalProperties:false with no properties must be closed")
+	}
+	got := Check([]Call{{Tool: "a__b", Keys: []string{"x"}, Exact: true}}, map[string]Schema{"a__b": closed})
+	if len(got) != 1 || got[0].Code != CodeUnknown {
+		t.Errorf("warnings = %+v", got)
+	}
+	if schema(t, `{"type":"object","properties":{}}`).Open == false {
+		t.Error("a schema with no properties and no additionalProperties stays open")
+	}
+}
+
+func TestExtractZeroArgumentAndNestedCalls(t *testing.T) {
+	src := "await tools.github.get_me();\n" +
+		"await tools.call(\"VPS__exec\");\n" +
+		"await tools.a.b({ x: await tools.c.d({ q: 1 }), y: 2 });\n"
+	want := []Call{
+		{Tool: "github__get_me", Exact: true, Line: 1},
+		{Tool: "VPS__exec", Exact: true, Line: 2},
+		{Tool: "a__b", Keys: []string{"x", "y"}, Exact: true, Line: 3},
+		{Tool: "c__d", Keys: []string{"q"}, Exact: true, Line: 3},
+	}
+	if got := Extract(src); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Extract:\n got %v\nwant %v", got, want)
+	}
+}
+
+func TestHasTopLevelReturn(t *testing.T) {
+	cases := map[string]bool{
+		"return 1;":            true,
+		"if (x) { return 1; }": true,
+		"for (const a of b) { if (a) { return a; } }":           true,
+		"try { return 1 } catch (e) { return 2 }":               true,
+		"items.map(x => { return x.id; }); console.log(items);": false,
+		"items.map(function (x) { return x; });":                false,
+		"const o = { m() { return 1; } }; console.log(o);":      false,
+		"// return 1\nconsole.log('return');":                   false,
+		"console.log(`${(() => { return 1 })()}`);":             false,
+		"const f = async () => { return 1 }; return await f();": true,
+		"x.return = 1;": false,
+	}
+	for src, want := range cases {
+		if got := HasTopLevelReturn(src); got != want {
+			t.Errorf("HasTopLevelReturn(%q) = %v, want %v", src, got, want)
+		}
+	}
+}

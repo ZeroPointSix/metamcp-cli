@@ -14,12 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ZeroPointSix/metamcp-cli/internal/config"
 	"github.com/ZeroPointSix/metamcp-cli/internal/output"
+	"github.com/ZeroPointSix/metamcp-cli/internal/spawn"
 	"github.com/ZeroPointSix/metamcp-cli/internal/version"
 )
 
@@ -127,10 +129,10 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if a.result == nil {
 		return a.exit
 	}
+	a.spill()
 	if !a.result.OK && a.result.Error != nil {
 		fmt.Fprintf(stderr, "mcli: %s\n", summaryLine(a.result.Error))
 	}
-	a.spill()
 	if err := output.Print(stdout, a.result, prettyOutput(stdout)); err != nil {
 		return output.ExitFailure
 	}
@@ -187,25 +189,70 @@ func maxOutput() int {
 	return n // 0 disables spilling
 }
 
-func spillDir() string {
-	if d := os.Getenv(config.EnvOutputDir); d != "" {
-		return d
+// spillMaxAge is how long files in the spill directory are kept.
+const spillMaxAge = 24 * time.Hour
+
+// spillDir returns the directory for spilled output: $MCLI_OUTPUT_DIR, else
+// a per-user private directory. Files older than spillMaxAge are removed.
+func spillDir() (string, error) {
+	dir := os.Getenv(config.EnvOutputDir)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	} else {
+		var err error
+		if dir, err = spawn.OutputDir(); err != nil {
+			return "", err
+		}
 	}
-	return filepath.Join(os.TempDir(), "mcli-output")
+	pruneSpills(dir)
+	return dir, nil
+}
+
+// pruneSpills removes spill files older than spillMaxAge. Only names that
+// SpillData/SpillConsole create are touched; errors are ignored.
+func pruneSpills(dir string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, output.SpillPattern))
+	cutoff := time.Now().Add(-spillMaxAge)
+	for _, m := range matches {
+		if st, err := os.Lstat(m); err == nil && st.Mode().IsRegular() && st.ModTime().Before(cutoff) {
+			_ = os.Remove(m)
+		}
+	}
 }
 
 // spill writes data (always with --out, else when it is over the budget) and
 // an oversized console to files, leaving a path, size and preview on stdout.
+// An automatic spill that fails falls back to stdout; a failed --out is an
+// error, because the caller will look for the file.
 func (a *app) spill() {
 	r := a.result
 	limit := maxOutput()
-	if a.outPath != "" || (limit > 0 && len(r.Data) > limit) {
-		if err := r.SpillData(a.outPath, spillDir()); err != nil {
+	auto := limit > 0 && len(r.Data) > limit
+	if (a.outPath != "" || auto) && len(r.Data) > 0 {
+		dir := ""
+		var err error
+		if a.outPath == "" {
+			dir, err = spillDir()
+		}
+		if err == nil {
+			err = r.SpillData(a.outPath, dir)
+		}
+		switch {
+		case err != nil && a.outPath != "":
+			e := output.Newf(output.CodeOutFile, "could not write data to %s: %v", a.outPath, err)
+			r.OK, r.Error = false, e
+		case err != nil:
 			fmt.Fprintf(a.stderr, "mcli: could not write data to a file, printing it instead: %v\n", err)
 		}
 	}
 	if limit > 0 && len(r.Console) > limit {
-		if err := r.SpillConsole(spillDir()); err != nil {
+		dir, err := spillDir()
+		if err == nil {
+			err = r.SpillConsole(dir)
+		}
+		if err != nil {
 			fmt.Fprintf(a.stderr, "mcli: could not write console output to a file: %v\n", err)
 		}
 	}

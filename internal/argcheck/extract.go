@@ -7,9 +7,11 @@ import (
 )
 
 // Extract finds tool calls whose first (or, for tools.call, second) argument
-// is an object literal. It is a small lexer, not a parser: it skips strings,
-// template literals and comments, and gives up on a call it cannot read
-// rather than guessing.
+// is an object literal or absent. It is a small lexer, not a parser: it skips
+// strings, template literals (calls inside ${...} are not seen), comments
+// and anything it cannot read rather than guessing. Regular expression
+// literals are not recognised; a quote or brace inside one can make it lose
+// track for the rest of the script, which only means fewer warnings.
 func Extract(src string) []Call {
 	s := &scanner{src: src}
 	var calls []Call
@@ -32,9 +34,10 @@ func Extract(src string) []Call {
 				if call, ok := s.call(); ok {
 					call.Line = 1 + strings.Count(s.src[:start], "\n")
 					calls = append(calls, call)
-				} else {
-					s.pos = save
 				}
+				// Resume right after "tools" so calls nested in the arguments
+				// (tools.a.b({ x: await tools.c.d({}) })) are found too.
+				s.pos = save
 			}
 		default:
 			s.pos++
@@ -239,6 +242,9 @@ func (s *scanner) call() (Call, bool) {
 			s.skipTrivia()
 			if s.pos < len(s.src) && (s.src[s.pos] == '"' || s.src[s.pos] == '\'') {
 				name = catalog.Normalize(s.skipString(s.src[s.pos]))
+				if s.expect(')') {
+					return Call{Tool: name, Exact: true}, true // no arguments
+				}
 				if !s.expect(',') {
 					return Call{}, false
 				}
@@ -256,6 +262,9 @@ func (s *scanner) call() (Call, bool) {
 		name = first + "__" + second
 	}
 	s.skipTrivia()
+	if s.pos < len(s.src) && s.src[s.pos] == ')' {
+		return Call{Tool: name, Exact: true}, true // no arguments
+	}
 	if s.pos >= len(s.src) || s.src[s.pos] != '{' {
 		return Call{}, false
 	}

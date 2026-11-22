@@ -51,8 +51,11 @@ func ParseSchema(raw json.RawMessage) Schema {
 		out.Properties = append(out.Properties, k)
 	}
 	slices.Sort(out.Properties)
+	// additionalProperties: false always closes the schema, even with no
+	// properties (a tool that takes no arguments). Otherwise a schema that
+	// lists no properties, or allows extra ones, is open.
 	ap := strings.TrimSpace(string(s.AdditionalProperties))
-	out.Open = len(out.Properties) == 0 || (ap != "" && ap != "false")
+	out.Open = ap != "false" && (len(out.Properties) == 0 || ap != "")
 	return out
 }
 
