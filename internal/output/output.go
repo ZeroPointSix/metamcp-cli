@@ -3,10 +3,15 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"time"
+	"unicode/utf8"
 )
 
 // Exit codes. Agents branch on these, so they are part of the public contract.
@@ -43,6 +48,15 @@ const (
 	CodeDoctor = "E_DOCTOR"
 	// CodeToolNotFound is also produced by the server's Code Mode.
 	CodeToolNotFound = "E_TOOL_NOT_FOUND"
+	// CodeUpstreamUnavailable means MetaMCP's per-upstream circuit breaker or
+	// bulkhead rejected a child call before forwarding it: retrying later is
+	// safe for that call.
+	CodeUpstreamUnavailable = "E_UPSTREAM_UNAVAILABLE"
+	// CodeOutFile means the script ran but --out could not be written.
+	CodeOutFile = "E_OUT_FILE"
+	// CodeArgCheck means --strict-args could not read the tool schemas, so
+	// nothing was run.
+	CodeArgCheck = "E_ARG_CHECK"
 )
 
 var exitByCode = map[string]int{
@@ -68,6 +82,9 @@ var exitByCode = map[string]int{
 	"E_OUTPUT_LIMIT":        ExitLimit,
 	"E_MEMORY_LIMIT":        ExitLimit,
 	"E_TOOL_LIST_TOO_LARGE": ExitLimit,
+	CodeUpstreamUnavailable: ExitLimit,
+	CodeArgCheck:            ExitLimit,
+	CodeOutFile:             ExitUsage,
 }
 
 // ExitFor maps an error code to its exit code. Unknown codes are failures.
@@ -86,6 +103,9 @@ const (
 	HintAuth      = "The API key was rejected. Update it with `printf '%s' \"$KEY\" | mcli config set --api-key-stdin`."
 	HintModule    = "Scripts are function bodies: remove import/export and use the global `tools` object (tools.search / tools.list / tools.call / tools.<server>.<tool>). Use top-level await and `return` the result."
 	HintLimit     = "A server limit was hit. Split the work into smaller executes, return less data, or retry later if the server was busy."
+	HintUpstream  = "MetaMCP's circuit breaker for this upstream server rejected the call without forwarding it. Retry the same script in a few seconds; it is not a script bug."
+	HintArgCheck  = "--strict-args could not read the tool schemas, so the script was not run. Retry in a moment, or drop --strict-args."
+	HintOutFile   = "The script DID run: its result is in this output's data field, but it could not be written to --out. Do not re-run a script that writes; save data from here or fix the path."
 )
 
 func defaultHint(code string, exit int) string {
@@ -96,6 +116,12 @@ func defaultHint(code string, exit int) string {
 		return HintAuth
 	case code == CodeScriptModule:
 		return HintModule
+	case code == CodeUpstreamUnavailable:
+		return HintUpstream
+	case code == CodeArgCheck:
+		return HintArgCheck
+	case code == CodeOutFile:
+		return HintOutFile
 	case exit == ExitUncertain:
 		return HintUncertain
 	case exit == ExitLimit:
@@ -110,9 +136,11 @@ type Error struct {
 	Message string `json:"message"`
 	TraceID string `json:"trace_id,omitempty"`
 	// Line and Column point into the caller's script file (1-based) when known.
-	Line   int    `json:"line,omitempty"`
-	Column int    `json:"column,omitempty"`
-	Hint   string `json:"hint,omitempty"`
+	Line   int `json:"line,omitempty"`
+	Column int `json:"column,omitempty"`
+	// Tool is the child tool call that failed, when known.
+	Tool string `json:"tool,omitempty"`
+	Hint string `json:"hint,omitempty"`
 	// Suggestions are existing tool names close to a missing one.
 	Suggestions []string `json:"suggestions,omitempty"`
 	Exit        int      `json:"exit"`
@@ -145,9 +173,12 @@ type Meta struct {
 type Result struct {
 	OK bool `json:"ok"`
 	// Data is the business payload. On success it is always present, even when
-	// it is JSON null (a script that returns nothing).
+	// it is JSON null (a script that returns nothing), unless it was written to
+	// a file: then DataFile says where.
 	Data        json.RawMessage   `json:"data,omitempty"`
+	DataFile    *Spill            `json:"data_file,omitempty"`
 	Console     string            `json:"console,omitempty"`
+	ConsoleFile *Spill            `json:"console_file,omitempty"`
 	Warnings    []json.RawMessage `json:"warnings,omitempty"`
 	Meta        *Meta             `json:"meta,omitempty"`
 	Error       *Error            `json:"error,omitempty"`
@@ -193,10 +224,104 @@ func Fail(err error) *Result {
 	return &Result{OK: false, Error: e}
 }
 
-// Print writes r as one JSON document followed by a newline.
-func Print(w io.Writer, r *Result) error {
+// Print writes r as one JSON document followed by a newline. pretty indents
+// it for people; agents and pipes get one compact line.
+func Print(w io.Writer, r *Result, pretty bool) error {
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
+	if pretty {
+		enc.SetIndent("", "  ")
+	}
 	return enc.Encode(r)
+}
+
+// Spill describes a payload written to a file instead of stdout.
+type Spill struct {
+	Path string `json:"path"`
+	// Bytes is the size of the file.
+	Bytes   int    `json:"bytes"`
+	Preview string `json:"preview"`
+}
+
+// SpillPattern matches the names of files SpillData/SpillConsole create in a
+// directory, for pruning old ones.
+var SpillPattern = "[0-9]*-[0-9]*-*"
+
+// previewBytes bounds Spill.Preview.
+const previewBytes = 1024
+
+// SpillData moves Data to path, or to a new file in dir (which must exist)
+// when path is empty. Only Data goes to the file: the JSON as received,
+// indented without decoding, so large integers, key order and characters
+// such as "<" are kept exactly and jq can read it directly.
+func (r *Result) SpillData(path, dir string) error {
+	if len(r.Data) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, r.Data, "", "  "); err != nil {
+		buf.Reset()
+		buf.Write(r.Data)
+	}
+	buf.WriteByte('\n')
+	path, err := writeSpill(path, dir, ".json", buf.Bytes())
+	if err != nil {
+		return err
+	}
+	r.DataFile = &Spill{Path: path, Bytes: buf.Len(), Preview: preview(string(r.Data))}
+	r.Data = nil
+	return nil
+}
+
+// SpillConsole moves Console to a new file under dir.
+func (r *Result) SpillConsole(dir string) error {
+	if r.Console == "" {
+		return nil
+	}
+	data := []byte(r.Console + "\n")
+	path, err := writeSpill("", dir, ".console.txt", data)
+	if err != nil {
+		return err
+	}
+	r.ConsoleFile = &Spill{Path: path, Bytes: len(data), Preview: preview(r.Console)}
+	r.Console = ""
+	return nil
+}
+
+func writeSpill(path, dir, ext string, data []byte) (string, error) {
+	if path == "" {
+		f, err := os.CreateTemp(dir, time.Now().UTC().Format("20060102-150405")+"-*"+ext)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		if _, err := f.Write(data); err != nil {
+			return "", err
+		}
+		return f.Name(), f.Close()
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", err
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return path, nil
+}
+
+// preview cuts s to previewBytes without splitting a UTF-8 sequence.
+func preview(s string) string {
+	if len(s) <= previewBytes {
+		return s
+	}
+	cut := previewBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }

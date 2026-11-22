@@ -22,7 +22,9 @@
 - 先运行 `mcli --help` 了解用法：`mcli search` 找工具，`mcli execute` 运行调用工具的 TypeScript 脚本；`mcli tools --category <server>` 列出某个 server 的全部工具，`mcli schema <server__tool>` 读完整参数定义。
 - 参数不确定时先用 `mcli schema` 查清工具定义，不要猜。
 - 工具名从 search/tools 的输出原样复制。很多名字带连字符，脚本里写成 `tools.VPS["run-script"](args)`；报 `E_TOOL_NOT_FOUND` 时看 `error.suggestions`。`Object.keys(tools.VPS)` 是空的，不能用来枚举工具。
-- stdout 是一个 JSON 对象。按退出码处理：0 成功；1 根据错误修正后重试；2 按 hint 改写；3 认证失败，停止并报告；4 结果不确定，先确认目标状态再决定是否重试，绝不盲目重跑写操作；5 触及服务端限制，拆小或稍后再试。
+- 一两行的调用用 `mcli execute -e '<代码>'`；脚本里用 `return` 返回结果（只 `console.log` 时 data 为 null）。
+- stdout 是一个 JSON 对象。按退出码处理：0 成功；1 根据错误修正后重试；2 按 hint 改写；3 认证失败，停止并报告；4 结果不确定，先确认目标状态再决定是否重试，绝不盲目重跑写操作；5 触及服务端限制或上游暂不可用（`E_UPSTREAM_UNAVAILABLE`），拆小或稍后原样重试。
+- 结果里有 `warnings` 先看：`W_UNKNOWN_ARGUMENT` 说明参数名写错了，工具可能忽略了它，按 `suggestion` 改正后再用结果。结果过大时 stdout 只给 `data_file.path`，用 `jq` / `head` 读文件，不要整份打印。
 - 有副作用的操作（创建、修改、发送、删除）先查出候选对象并确认，再单独执行写入。
 - 用 `--note` 写一句调用目的，会记入审计日志。
 ```

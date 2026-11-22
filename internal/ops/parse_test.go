@@ -2,6 +2,7 @@ package ops
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -136,5 +137,49 @@ func TestSearchSuccess(t *testing.T) {
 	res := &mcp.CallToolResult{StructuredContent: map[string]any{"matched": true, "tools": []any{}}}
 	if r := parseSearch(res); !r.OK || string(r.Data) != `{"matched":true,"tools":[]}` {
 		t.Fatalf("structured: %+v", r)
+	}
+}
+
+func TestCompactKeepsLargeIntegersAndKeyOrder(t *testing.T) {
+	r := parseExecute(result(successMeta, "{\n  \"z\": 1,\n  \"id\": 12345678901234567890,\n  \"html\": \"<a&b>\"\n}"))
+	if !r.OK || string(r.Data) != `{"z":1,"id":12345678901234567890,"html":"<a&b>"}` {
+		t.Fatalf("data = %s", r.Data)
+	}
+}
+
+func TestNestedChildErrorIsFlattenedOnce(t *testing.T) {
+	inner, _ := json.Marshal(map[string]any{
+		"ok": false, "partial": false, "result": nil, "trace_id": "trace_inner", "trace": []any{},
+		"stats": map[string]any{"duration_ms": 1},
+		"diagnostics": []any{map[string]any{
+			"severity": "error", "code": "E_RUNTIME",
+			"message":  "ChildCallError: MCP error -32603: Upstream MCP is temporarily unavailable",
+			"location": map[string]any{"line": 3, "column": 1, "tool": "maton__run_action"},
+		}},
+	})
+	outer, _ := json.Marshal(map[string]any{
+		"ok": false, "partial": true, "result": nil, "trace_id": "trace_outer", "trace": []any{},
+		"stats": map[string]any{"duration_ms": 1},
+		"diagnostics": []any{map[string]any{
+			"severity": "error", "code": "E_RUNTIME", "message": "ChildCallError: " + string(inner),
+			"stack":    "ChildCallError: " + string(inner),
+			"location": map[string]any{"line": 1, "column": 1, "tool": "external__fetch_url"},
+		}},
+	})
+	r := parseExecute(result(nil, string(outer)))
+	e := r.Error
+	if e == nil || e.Code != output.CodeUpstreamUnavailable || e.Exit != output.ExitLimit {
+		t.Fatalf("error = %+v", e)
+	}
+	if e.Message != "ChildCallError: MCP error -32603: Upstream MCP is temporarily unavailable" || e.Tool != "maton__run_action" {
+		t.Errorf("message %q tool %q", e.Message, e.Tool)
+	}
+	if n := strings.Count(e.Hint, "partial"); n != 1 {
+		t.Errorf("hint mentions partial %d times: %q", n, e.Hint)
+	}
+	var d map[string]any
+	_ = json.Unmarshal(r.Diagnostics[0], &d)
+	if d["message"] != e.Message || d["stack"] != nil {
+		t.Errorf("diagnostic not tidied: %v", d)
 	}
 }

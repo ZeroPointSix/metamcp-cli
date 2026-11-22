@@ -22,6 +22,15 @@ const (
 	EnvNoDaemon = "MCLI_NO_DAEMON"
 	EnvIdle     = "MCLI_DAEMON_IDLE"
 	EnvRuntime  = "MCLI_RUNTIME_DIR"
+	// EnvOutput forces "pretty" or "compact" JSON on stdout.
+	EnvOutput = "MCLI_OUTPUT"
+	// EnvMaxOutput is the stdout budget in bytes for data/console before they
+	// go to a file; 0 never spills.
+	EnvMaxOutput = "MCLI_MAX_OUTPUT"
+	// EnvOutputDir is where spilled output files go.
+	EnvOutputDir = "MCLI_OUTPUT_DIR"
+	// EnvArgCheck=0 turns off the local argument check before execute.
+	EnvArgCheck = "MCLI_ARG_CHECK"
 )
 
 // File is the on-disk configuration (0600).

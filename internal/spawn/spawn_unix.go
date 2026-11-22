@@ -34,6 +34,13 @@ func shortDir() string {
 	return filepath.Join("/tmp", fmt.Sprintf("mcli-%d", os.Getuid()))
 }
 
+// OutputDir is the default directory for output written to files: private to
+// this user (0700, owned by us), like the runtime directory.
+func OutputDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("mcli-output-%d", os.Getuid()))
+	return dir, ensurePrivateDir(dir)
+}
+
 // ensurePrivateDir creates dir (0700) or checks that an existing one is a
 // directory owned by this user, tightening its permissions if needed.
 func ensurePrivateDir(dir string) error {

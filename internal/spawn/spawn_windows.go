@@ -36,6 +36,17 @@ func runtimeDir() (string, error) {
 	return dir, nil
 }
 
+// OutputDir is the default directory for output written to files, under the
+// per-user cache directory.
+func OutputDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "mcli", "output")
+	return dir, os.MkdirAll(dir, 0o700)
+}
+
 // endpointFor names a per-user pipe: \\.\pipe\mcli-<user SID hash>-<id>.
 func endpointFor(_ string, id string) (string, error) {
 	sid, err := ipc.CurrentUserSID()

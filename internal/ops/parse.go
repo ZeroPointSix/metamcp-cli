@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -63,16 +64,14 @@ func payload(res *mcp.CallToolResult) (json.RawMessage, string, bool) {
 	return data, console, true
 }
 
+// compact removes insignificant whitespace without decoding: a round trip
+// through any would turn large integers into float64 and reorder keys.
 func compact(s string) json.RawMessage {
-	var v any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, []byte(s)); err != nil {
 		return json.RawMessage(s)
 	}
-	data, err := json.Marshal(v)
-	if err != nil {
-		return json.RawMessage(s)
-	}
-	return data
+	return buf.Bytes()
 }
 
 // facadeError recognises {"error": "..."} payloads.
@@ -131,9 +130,81 @@ type diagnostic struct {
 	Code     string `json:"code"`
 	Message  string `json:"message"`
 	Location *struct {
-		Line   int `json:"line"`
-		Column int `json:"column"`
+		Line   int    `json:"line"`
+		Column int    `json:"column"`
+		Tool   string `json:"tool"`
 	} `json:"location"`
+}
+
+// childErrorPrefix starts a child failure whose message embeds the child's own
+// Code Mode envelope (an external tool that is itself a Code Mode script).
+const childErrorPrefix = "ChildCallError: "
+
+// maxNesting bounds how many embedded envelopes flatten unwraps.
+const maxNesting = 8
+
+// flatten unwraps error messages of the form "ChildCallError: {<envelope>}"
+// down to the innermost error, which is the only part an agent can act on.
+// tool is the innermost child tool named on the way, if any.
+func flatten(message string) (flat, tool string) {
+	flat = message
+	for range maxNesting {
+		rest, ok := strings.CutPrefix(flat, childErrorPrefix)
+		if !ok || !strings.HasPrefix(strings.TrimSpace(rest), "{") {
+			return flat, tool
+		}
+		env, ok := asEnvelope(json.RawMessage(rest))
+		if !ok {
+			return flat, tool
+		}
+		var inner *diagnostic
+		for _, raw := range env.Diagnostics {
+			var d diagnostic
+			if json.Unmarshal(raw, &d) == nil && d.Severity != "warning" {
+				inner = &d
+				break
+			}
+		}
+		if inner == nil || inner.Message == "" {
+			return flat, tool
+		}
+		if inner.Location != nil && inner.Location.Tool != "" {
+			tool = inner.Location.Tool
+		}
+		flat = inner.Message
+	}
+	return flat, tool
+}
+
+// upstreamUnavailable is the message MetaMCP's per-upstream circuit breaker
+// and bulkhead use for a call they rejected without forwarding it.
+const upstreamUnavailable = "Upstream MCP is temporarily unavailable"
+
+// tidyDiagnostics flattens embedded envelopes in diagnostic messages and
+// drops sandbox stack traces: positions are already in "location".
+func tidyDiagnostics(diags []json.RawMessage) {
+	for i, raw := range diags {
+		var d map[string]any
+		if json.Unmarshal(raw, &d) != nil {
+			continue
+		}
+		changed := false
+		if msg, ok := d["message"].(string); ok {
+			if flat, _ := flatten(msg); flat != msg {
+				d["message"], changed = flat, true
+			}
+		}
+		if _, ok := d["stack"]; ok {
+			delete(d, "stack")
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		if data, err := json.Marshal(d); err == nil {
+			diags[i] = data
+		}
+	}
 }
 
 // asEnvelope reports whether data is a Code Mode diagnostic envelope.
@@ -225,15 +296,29 @@ func fromEnvelope(env *envelope, meta *output.Meta, console string) *output.Resu
 		return r
 	}
 
-	code, message := "E_RUNTIME", "execution failed"
+	code, message, tool := "E_RUNTIME", "execution failed", ""
 	if firstErr != nil {
 		code, message = firstErr.Code, firstErr.Message
+		if firstErr.Location != nil {
+			tool = firstErr.Location.Tool
+		}
 	}
-	if code == "E_RUNTIME" && strings.Contains(message, "pool is at capacity") {
+	if flat, inner := flatten(message); flat != message {
+		message = flat
+		if inner != "" {
+			tool = inner
+		}
+	}
+	switch {
+	case code == "E_RUNTIME" && strings.Contains(message, "pool is at capacity"):
 		code = output.CodeCapacity
+	case strings.Contains(message, upstreamUnavailable):
+		code = output.CodeUpstreamUnavailable
 	}
+	tidyDiagnostics(env.Diagnostics)
 	e := output.New(code, message)
 	e.TraceID = env.TraceID
+	e.Tool = tool
 	if firstErr != nil && firstErr.Location != nil {
 		e.Line, e.Column = firstErr.Location.Line, firstErr.Location.Column
 	}

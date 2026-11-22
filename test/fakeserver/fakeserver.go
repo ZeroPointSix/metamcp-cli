@@ -66,14 +66,16 @@ type Server struct {
 	lastCode string
 	reauth   map[string]bool
 
-	Created     atomic.Int64 // sessions created (initialize responses)
-	Deleted     atomic.Int64 // DELETE requests for live sessions
-	Orphans     atomic.Int64 // session-less POSTs that were not initialize
-	Searches    atomic.Int64
-	Executes    atomic.Int64
-	Cancelled   atomic.Int64 // execute handlers that saw ctx cancellation
-	inFlight    atomic.Int64
-	MaxInFlight atomic.Int64
+	Created      atomic.Int64 // sessions created (initialize responses)
+	Deleted      atomic.Int64 // DELETE requests for live sessions
+	Orphans      atomic.Int64 // session-less POSTs that were not initialize
+	Searches     atomic.Int64
+	Executes     atomic.Int64
+	Cancelled    atomic.Int64 // execute handlers that saw ctx cancellation
+	ArgChecks    atomic.Int64 // argument-check schema lookups
+	FailArgCheck atomic.Bool  // make argument-check schema lookups fail
+	inFlight     atomic.Int64
+	MaxInFlight  atomic.Int64
 	// FailStatus, when non-zero, answers every POST with this HTTP status.
 	FailStatus atomic.Int32
 }
@@ -296,6 +298,9 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 		return res
 	}
 
+	if s.FailArgCheck.Load() && strings.Contains(args.Code, "inputSchema") {
+		return fail("E_RUNTIME", "catalog unavailable", 0, 0, false), nil
+	}
 	if rest, ok := strings.CutPrefix(args.Code, "const args = "); ok {
 		line, body, _ := strings.Cut(rest, "\n")
 		var in map[string]any
@@ -326,6 +331,30 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 				return fail("E_RUNTIME", "Error: __THROW__", i+1, col+1, false), nil
 			}
 		}
+	case strings.Contains(args.Code, "__UPSTREAM_DOWN__"):
+		// An external tool that is itself a Code Mode script: its child call
+		// hit MetaMCP's circuit breaker, and the whole inner envelope comes
+		// back embedded in the outer error message.
+		inner, _ := json.Marshal(map[string]any{
+			"ok": false, "partial": false, "exit_code": 1, "result": nil,
+			"diagnostics": []any{map[string]any{
+				"severity": "error", "code": "E_RUNTIME", "source": "execute",
+				"message":  "ChildCallError: MCP error -32603: Upstream MCP is temporarily unavailable",
+				"stack":    "ChildCallError: MCP error -32603\n    at safeError (code-mode-bootstrap.js:17:20)",
+				"location": map[string]any{"line": 213, "column": 17, "tool": "maton__run_action"},
+			}},
+			"trace_id": "trace_inner", "trace": []any{},
+			"stats": map[string]any{"duration_ms": 1, "child_calls": 1, "operations": 1, "child_failures": 1, "output_bytes": 0},
+		})
+		res := fail("E_RUNTIME", "ChildCallError: "+string(inner), 1, 1, false)
+		var env map[string]any
+		_ = json.Unmarshal([]byte(res.Content[0].(*mcp.TextContent).Text), &env)
+		d := env["diagnostics"].([]any)[0].(map[string]any)
+		d["location"].(map[string]any)["tool"] = "external__fetch_url"
+		d["stack"] = "ChildCallError: " + string(inner)
+		data, _ := json.Marshal(env)
+		res.Content[0] = &mcp.TextContent{Text: string(data)}
+		return res, nil
 	case strings.Contains(args.Code, "__LIMIT__"):
 		return fail("E_CALL_LIMIT", "operation budget exhausted", 0, 0, false), nil
 	case strings.Contains(args.Code, "__PARTIAL__"):
@@ -341,6 +370,12 @@ func (s *Server) execute(ctx context.Context, req *mcp.CallToolRequest) (*mcp.Ca
 		return res, nil
 	}
 
+	if strings.Contains(args.Code, "__NO_RETURN__") {
+		res := text("null")
+		res.Content = append(res.Content, &mcp.TextContent{Text: "<console_output>\n{\"printed\":true}\n</console_output>"})
+		res.Meta = meta(false, "success")
+		return res, nil
+	}
 	res := asText(map[string]any{"code_len": len(args.Code), "timeout_ms": args.TimeoutMS, "note": args.Note})
 	if strings.Contains(args.Code, "console.log") {
 		res.Content = append(res.Content, &mcp.TextContent{Text: "<console_output>\nhello\n\n</console_output>"})
@@ -454,6 +489,16 @@ func (s *Server) catalogScript(body string, args map[string]any) any {
 			return map[string]any{"items": items, "categories": cats}
 		}
 		return map[string]any{"items": items, "declaration": args["declaration"]}
+	case strings.Contains(body, "inputSchema"): // argument check
+		s.ArgChecks.Add(1)
+		items := []any{}
+		for _, n := range strs(args["names"]) {
+			if inCatalog(n) {
+				e := entry(n, true)
+				items = append(items, map[string]any{"name": n, "inputSchema": e["inputSchema"]})
+			}
+		}
+		return items
 	default: // name lookup
 		found := []string{}
 		for _, n := range strs(args["names"]) {

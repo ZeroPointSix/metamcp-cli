@@ -73,8 +73,10 @@ jobs:
           sleep 2
           MCLI_DOWNLOAD_BASE=http://127.0.0.1:18765 MCLI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
           "$RUNNER_TEMP/bin/mcli" --version | grep -q v0.0.0-ci
-          # A tampered checksum must abort the install.
-          sed -i.bak '1s/^./0/' "$rel/checksums.txt"
+          # A tampered checksum must abort the install. "x" is not a hex
+          # digit, so the line always changes (a "0" left hashes that already
+          # start with 0 untouched, which made this step flaky).
+          sed -i.bak '1s/^./x/' "$rel/checksums.txt"
           if MCLI_DOWNLOAD_BASE=http://127.0.0.1:18765 MCLI_INSTALL_DIR="$RUNNER_TEMP/bad" sh install.sh; then
             echo "install succeeded despite a bad checksum"; exit 1
           fi
